@@ -759,7 +759,8 @@ RESPAWN_MAX_DELAY  = 30.0    # backoff cap
 
 
 class Gateway:
-    def __init__(self):
+    def __init__(self, profile: str | None = None):
+        self.profile = profile
         self.proc: asyncio.subprocess.Process | None = None
         self.state = "stopped"
         self.logs: deque[str] = deque(maxlen=500)
@@ -793,8 +794,12 @@ class Gateway:
             print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
             # Write config.yaml so hermes picks up the model (env vars alone aren't always enough)
             write_config_yaml(read_env(ENV_FILE))
+            cmd = ["hermes"]
+            if self.profile:
+                cmd += ["-p", self.profile]
+            cmd += ["gateway"]
             self.proc = await asyncio.create_subprocess_exec(
-                "hermes", "gateway",
+                *cmd,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env=env,
@@ -906,6 +911,11 @@ class Gateway:
 
 
 gw = Gateway()
+# Additional profile gateways — supervised by the same Railway admin server
+# so they survive container restarts alongside the default profile.
+# Set HERMES_EXTRA_PROFILES=eko,other to auto-start extra profile gateways.
+EXTRA_PROFILES = [p.strip() for p in os.environ.get("HERMES_EXTRA_PROFILES", "").split(",") if p.strip()]
+extra_gateways: list[Gateway] = [Gateway(profile=p) for p in EXTRA_PROFILES]
 cfg_lock = asyncio.Lock()
 
 
@@ -1338,6 +1348,16 @@ async def auto_start():
         asyncio.create_task(gw.start())
     else:
         print("[server] Config incomplete — gateway not started. Configure provider + model in the admin UI.", flush=True)
+    # Start additional profile gateways (e.g. eko) that have their own .env with
+    # credentials configured. These are supervised independently with the same
+    # crash-loop protection as the default profile.
+    for eg in extra_gateways:
+        profile_env = Path(HERMES_HOME) / "profiles" / eg.profile / ".env"
+        if profile_env.exists():
+            print(f"[server] Starting extra profile gateway: {eg.profile}", flush=True)
+            asyncio.create_task(eg.start())
+        else:
+            print(f"[server] Extra profile '{eg.profile}' has no .env — skipping", flush=True)
 
 
 @asynccontextmanager
@@ -1352,6 +1372,7 @@ async def lifespan(app):
         await asyncio.gather(
             gw.stop(),
             dash.stop(),
+            *[eg.stop() for eg in extra_gateways],
             return_exceptions=True,
         )
         global _http_client
