@@ -33,8 +33,11 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
+import tempfile
 import time
+import zipfile
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -43,8 +46,11 @@ import httpx
 import websockets
 import websockets.exceptions
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
+from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import (
+    FileResponse,
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
@@ -1560,6 +1566,225 @@ async def api_pairing_revoke(request: Request):
     return JSONResponse({"ok": True})
 
 
+# ── Backup & Restore ─────────────────────────────────────────────────────────
+# Thin wrapper around hermes' OWN `hermes backup` / `hermes import` CLI
+# (hermes_cli/backup.py, verified against v2026.7.1) rather than reimplementing
+# file selection: it already excludes code checkouts/caches/venvs/lock files
+# from the walk, protects against zip-slip on extract, and — critically — skips
+# re-writing gateway_state.json/gateway.pid/cron.pid/gateway.lock/processes.json
+# even when present in the archive (_IMPORT_SKIP_NAMES). That's exactly the
+# "don't let a foreign pid file wedge the supervisor" concern invariant 6
+# already documents — we deliberately do not duplicate either behavior
+# ourselves. Re-verify both on a future Hermes version bump, same as every
+# other upstream-CLI assumption this template makes.
+BACKUP_DIR = Path(HERMES_HOME) / "backups"   # hermes' own pre-update-backup convention;
+                                              # this dir is itself in hermes' backup
+                                              # exclusion list, so snapshots here never
+                                              # bloat a future full backup.
+PRE_RESTORE_KEEP = 3
+BACKUP_SUBPROCESS_TIMEOUT = 600  # 10 min ceiling for both `hermes backup` and `hermes import`
+SNAPSHOT_NAME_RE = re.compile(r"^pre-restore-\d+-[0-9a-f]+\.zip$")
+
+backup_lock = asyncio.Lock()
+
+
+async def _run_hermes_cli(*args: str, timeout: float = BACKUP_SUBPROCESS_TIMEOUT) -> tuple[int, str]:
+    """Run a `hermes <args>` subcommand, capturing combined stdout+stderr.
+
+    Shares build_hermes_env() with Gateway/Dashboard so the CLI sees provider
+    keys saved via /setup (not just our own os.environ). Never raises — like
+    Gateway.start()/Dashboard.start(), a failed spawn (missing binary, bad env)
+    is reported as a (rc, message) pair so every caller gets one uniform error
+    shape instead of an unhandled exception surfacing as a generic 500.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "hermes", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=build_hermes_env(),
+        )
+    except OSError as e:
+        return 127, f"Could not launch hermes {' '.join(args)}: {e}"
+    try:
+        raw, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return 124, f"hermes {' '.join(args)} timed out after {timeout}s"
+    return proc.returncode, raw.decode(errors="replace")
+
+
+async def _hermes_version() -> str:
+    """Best-effort `hermes --version`, used only for the restore-time compat hint."""
+    try:
+        rc, out = await _run_hermes_cli("--version", timeout=15)
+        return out.strip() if rc == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _prune_pre_restore_snapshots() -> None:
+    snaps = sorted(BACKUP_DIR.glob("pre-restore-*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in snaps[PRE_RESTORE_KEEP:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def _sweep_stale_backup_tmpdirs() -> None:
+    """Clean up /tmp/hermes-backup-* left behind by a client aborting a download
+    mid-stream (the BackgroundTask cleanup then never runs). Safe: this prefix
+    is only ever used by api_backup_download, and /tmp is ephemeral anyway —
+    this just bounds growth across many downloads within one long-lived container.
+    """
+    for stale in Path(tempfile.gettempdir()).glob("hermes-backup-*"):
+        shutil.rmtree(stale, ignore_errors=True)
+
+
+async def api_backup_download(request: Request) -> Response:
+    if err := guard(request): return err
+    if backup_lock.locked():
+        return JSONResponse({"error": "A backup or restore is already in progress"}, status_code=409)
+    async with backup_lock:
+        tmp_dir = tempfile.mkdtemp(prefix="hermes-backup-")
+        zip_path = Path(tmp_dir) / "backup.zip"
+        rc, output = await _run_hermes_cli("backup", "-o", str(zip_path))
+        if rc != 0 or not zip_path.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return JSONResponse({"error": "Backup failed", "output": output[-2000:]}, status_code=500)
+
+        # Best-effort manifest entry for the restore-time version hint — never
+        # fails the download if this step errors.
+        try:
+            version = await _hermes_version()
+            with zipfile.ZipFile(zip_path, "a") as zf:
+                zf.writestr("template_manifest.json", json.dumps({
+                    "hermes_version": version,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "template": "hermes-agent-railway-template",
+                }))
+        except Exception:
+            pass
+
+        filename = f"hermes-backup-{int(time.time())}.zip"
+        return FileResponse(
+            zip_path,
+            filename=filename,
+            media_type="application/zip",
+            background=BackgroundTask(shutil.rmtree, tmp_dir, ignore_errors=True),
+        )
+
+
+async def api_backup_snapshots(request: Request) -> Response:
+    if err := guard(request): return err
+    out = []
+    if BACKUP_DIR.exists():
+        for p in sorted(BACKUP_DIR.glob("pre-restore-*.zip"), key=lambda p: p.stat().st_mtime, reverse=True):
+            st = p.stat()
+            out.append({"name": p.name, "size": st.st_size, "created_at": st.st_mtime})
+    return JSONResponse({"snapshots": out})
+
+
+async def api_backup_snapshot_download(request: Request) -> Response:
+    if err := guard(request): return err
+    name = request.path_params.get("name", "")
+    if not SNAPSHOT_NAME_RE.match(name):
+        return Response("Not Found", status_code=404, media_type="text/plain")
+    path = BACKUP_DIR / name
+    try:
+        path.resolve().relative_to(BACKUP_DIR.resolve())
+    except ValueError:
+        return Response("Not Found", status_code=404, media_type="text/plain")
+    if not path.is_file():
+        return Response("Not Found", status_code=404, media_type="text/plain")
+    return FileResponse(path, filename=name, media_type="application/zip")
+
+
+async def api_backup_restore(request: Request) -> Response:
+    if err := guard(request): return err
+    if backup_lock.locked():
+        return JSONResponse({"error": "A backup or restore is already in progress"}, status_code=409)
+
+    form = await request.form()
+    upload = form.get("file")
+    if not isinstance(upload, UploadFile):
+        return JSONResponse({"error": "No file uploaded"}, status_code=400)
+
+    async with backup_lock:
+        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".zip", prefix="hermes-restore-")
+        upload_path = Path(tmp_name)
+        try:
+            with os.fdopen(tmp_fd, "wb") as f:
+                while chunk := await upload.read(1024 * 1024):
+                    f.write(chunk)
+
+            if not zipfile.is_zipfile(upload_path):
+                return JSONResponse({"error": "Uploaded file is not a valid zip archive"}, status_code=400)
+
+            warning = None
+            with zipfile.ZipFile(upload_path) as zf:
+                names = {Path(n).name for n in zf.namelist()}
+                if not names & {"config.yaml", ".env", "state.db"}:
+                    return JSONResponse(
+                        {"error": "This doesn't look like a hermes backup (no config.yaml/.env/state.db found)"},
+                        status_code=400,
+                    )
+                if "template_manifest.json" in names:
+                    try:
+                        manifest = json.loads(zf.read("template_manifest.json"))
+                        backup_version = manifest.get("hermes_version", "")
+                        current_version = await _hermes_version()
+                        if backup_version and current_version != "unknown" and backup_version != current_version:
+                            warning = (
+                                f"Backup was created with hermes {backup_version}, this deployment runs "
+                                f"{current_version} — some settings may not carry over cleanly."
+                            )
+                    except Exception:
+                        pass
+
+            # Safety snapshot BEFORE touching anything live — abort rather than
+            # overwrite state with no undo copy behind it.
+            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            # secrets suffix avoids a same-second collision silently clobbering
+            # a distinct prior snapshot (two restores fired back-to-back).
+            snap_path = BACKUP_DIR / f"pre-restore-{int(time.time())}-{secrets.token_hex(4)}.zip"
+            rc, output = await _run_hermes_cli("backup", "-o", str(snap_path))
+            if rc != 0:
+                return JSONResponse(
+                    {"error": "Could not create the pre-restore safety snapshot; restore aborted.",
+                     "output": output[-2000:]},
+                    status_code=500,
+                )
+            _prune_pre_restore_snapshots()
+
+            await gw.stop()
+            await dash.stop()
+            try:
+                rc, output = await _run_hermes_cli("import", str(upload_path), "--force")
+            finally:
+                # Always bring the dashboard back; only auto-start the gateway if
+                # the (possibly just-restored) config is actually complete — same
+                # rule auto_start() uses on boot. This runs even if the import
+                # itself failed, so a bad upload doesn't leave the bot down too.
+                await dash.start()
+                if is_config_complete():
+                    await gw.start()
+
+            if rc != 0:
+                return JSONResponse({"error": "Restore failed", "output": output[-2000:]}, status_code=500)
+
+            resp = {"ok": True, "output": output[-2000:]}
+            if warning:
+                resp["warning"] = warning
+            return JSONResponse(resp)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+        finally:
+            upload_path.unlink(missing_ok=True)
+
+
 # ── Reverse proxy → Hermes dashboard ──────────────────────────────────────────
 _WIDGET_LINK_STYLE = (
     "background:rgba(20,24,31,0.92);backdrop-filter:blur(8px);"
@@ -1704,6 +1929,7 @@ async def auto_start():
 
 @asynccontextmanager
 async def lifespan(app):
+    _sweep_stale_backup_tmpdirs()
     # Dashboard runs always — it's the user-facing UI after setup is done,
     # and it's independent of gateway state.
     asyncio.create_task(dash.start())
@@ -1900,6 +2126,10 @@ routes = [
     Route("/setup/api/oauth/xai/start",         api_oauth_xai_start,  methods=["POST"]),
     Route("/setup/api/oauth/xai/status",        api_oauth_xai_status),
     Route("/setup/api/oauth/xai",               api_oauth_xai_delete, methods=["DELETE"]),
+    Route("/setup/api/backup/download",         api_backup_download),
+    Route("/setup/api/backup/restore",          api_backup_restore,  methods=["POST"]),
+    Route("/setup/api/backup/snapshots",        api_backup_snapshots),
+    Route("/setup/api/backup/snapshots/{name}", api_backup_snapshot_download),
 
     # /setup/* typos return a real 404 — not a silent proxy fallthrough.
     Route("/setup/{path:path}",                 route_setup_404,     methods=ANY_METHOD),

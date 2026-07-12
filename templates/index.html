@@ -755,6 +755,12 @@
       <span>Other Templates</span>
     </div>
 
+    <div class="nav-group-label" style="margin-top:8px">Data</div>
+    <div class="nav-item" :class="{active: page==='backup'}" @click="page='backup'">
+      <span class="nav-icon">⇅</span>
+      <span>Backup &amp; Restore</span>
+    </div>
+
     <div class="nav-divider" style="margin-top:auto;"></div>
 
     <div class="nav-item danger" @click="resetConfig()">
@@ -1266,6 +1272,75 @@
       </div>
     </div>
 
+    <!-- ── Backup panel ─────────────────────────────── -->
+    <div class="panel" :class="{active: page==='backup'}">
+      <div class="panel-header">
+        <div class="panel-title">Backup &amp; Restore</div>
+        <div class="panel-subtitle">Clone this deployment into another project</div>
+      </div>
+      <div class="panel-body">
+
+        <div class="section-label">Download Backup</div>
+        <div class="card" style="padding:16px;">
+          <p style="font-size:13px;color:var(--text-dim);line-height:1.6;margin:0 0 12px;">
+            Downloads a full snapshot of this deployment — config, provider keys, channel tokens,
+            approved users, chat history, memories, skills, and cron jobs — as a single .zip.
+            Upload it via Restore below on another deployment to reproduce this bot there.
+            <strong style="color:var(--text);">The file is not encrypted</strong> — it contains
+            your API keys and bot tokens in plain text, so store it somewhere safe.
+          </p>
+          <button class="btn" @click="downloadBackup()" :disabled="backupBusy">
+            <span x-show="!backupBusy">⬇ Download Backup</span>
+            <span x-show="backupBusy">Preparing…</span>
+          </button>
+        </div>
+
+        <div class="section-label" style="margin-top:20px;">Restore from Backup</div>
+        <div class="card" style="padding:16px;">
+          <p style="font-size:13px;color:var(--text-dim);line-height:1.6;margin:0 0 12px;">
+            Uploading a backup here <strong style="color:var(--text);">overwrites</strong> this
+            deployment's current config, credentials, and data with the backup's contents, then
+            briefly restarts the gateway. Anything changed here since the backup was taken (e.g.
+            newer user approvals) can be lost. A safety snapshot of the current state is taken
+            automatically first — see below if you need to recover it.
+          </p>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+            <input type="file" accept=".zip" @change="restoreFile = $event.target.files[0]" x-ref="restoreInput">
+            <button class="btn danger" @click="restoreBackup()" :disabled="restoreBusy || !restoreFile">
+              <span x-show="!restoreBusy">⬆ Upload &amp; Restore</span>
+              <span x-show="restoreBusy">Restoring…</span>
+            </button>
+          </div>
+        </div>
+
+        <div class="section-label" style="margin-top:20px;">Safety Snapshots</div>
+        <div class="empty-state" x-show="snapshots.length===0">None yet — one is taken automatically before every restore.</div>
+        <div class="card" style="padding:0;overflow:hidden;" x-show="snapshots.length>0">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Created</th>
+                <th>Size</th>
+                <th></th>
+              </tr>
+            </thead>
+            <tbody>
+              <template x-for="s in snapshots" :key="s.name">
+                <tr>
+                  <td style="color:var(--text-dim);font-size:12px;" x-text="fmtDate(s.created_at)"></td>
+                  <td style="color:var(--text-dim);font-size:12px;" x-text="fmtBytes(s.size)"></td>
+                  <td style="text-align:right;">
+                    <a class="btn sm" :href="'/setup/api/backup/snapshots/'+encodeURIComponent(s.name)">Download</a>
+                  </td>
+                </tr>
+              </template>
+            </tbody>
+          </table>
+        </div>
+
+      </div>
+    </div>
+
     <!-- ── Guide panel ─────────────────────────────── -->
     <div class="panel" :class="{active: page==='guide'}">
       <div class="panel-header">
@@ -1410,6 +1485,10 @@ function app() {
     logs: [],
     pending: [],
     approved: [],
+    snapshots: [],
+    backupBusy: false,
+    restoreBusy: false,
+    restoreFile: null,
     saving: false,
     restartOnSave: true,
     // True only when the SERVER has a persisted complete config.
@@ -1579,7 +1658,7 @@ function app() {
     },
 
     async init() {
-      await Promise.all([this.loadConfig(), this.loadStatus(), this.loadLogs(), this.loadPairing()]);
+      await Promise.all([this.loadConfig(), this.loadStatus(), this.loadLogs(), this.loadPairing(), this.loadSnapshots()]);
       setInterval(() => this.loadStatus(),  5000);
       setInterval(() => this.loadLogs(),    3000);
       setInterval(() => this.loadPairing(), 5000);
@@ -1705,6 +1784,68 @@ function app() {
       if (!confirm('Revoke access for this user?')) return;
       await fetch('/setup/api/pairing/revoke', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({platform,user_id}) });
       this.notify('Revoked', true); await this.loadPairing();
+    },
+
+    async downloadBackup() {
+      this.backupBusy = true;
+      try {
+        const r = await fetch('/setup/api/backup/download');
+        if (!r.ok) {
+          const e = await r.json().catch(() => ({}));
+          this.notify(e?.error || 'Backup failed', false);
+          return;
+        }
+        const blob = await r.blob();
+        const disposition = r.headers.get('content-disposition') || '';
+        const match = disposition.match(/filename="?([^"]+)"?/);
+        const filename = match ? match[1] : `hermes-backup-${Date.now()}.zip`;
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = filename;
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+        this.notify('Backup downloaded', true);
+      } catch (e) {
+        this.notify('Backup failed: ' + e.message, false);
+      }
+      this.backupBusy = false;
+    },
+
+    async loadSnapshots() {
+      try {
+        const r = await fetch('/setup/api/backup/snapshots');
+        if (r.ok) this.snapshots = (await r.json()).snapshots || [];
+      } catch {}
+    },
+
+    async restoreBackup() {
+      if (!this.restoreFile) return;
+      if (!confirm('Restore from this backup? This overwrites the current config, credentials, and data on this deployment, and briefly restarts the gateway. A safety snapshot of the current state is taken first.')) return;
+      this.restoreBusy = true;
+      try {
+        const fd = new FormData();
+        fd.append('file', this.restoreFile);
+        const r = await fetch('/setup/api/backup/restore', { method: 'POST', body: fd });
+        const d = await r.json().catch(() => ({}));
+        if (r.ok) {
+          this.notify(d.warning ? `Restored, but: ${d.warning}` : 'Restore complete', !d.warning);
+          this.restoreFile = null;
+          if (this.$refs.restoreInput) this.$refs.restoreInput.value = '';
+          await Promise.all([this.loadConfig(), this.loadStatus(), this.loadSnapshots()]);
+        } else {
+          this.notify(d.error || 'Restore failed', false);
+        }
+      } catch (e) {
+        this.notify('Restore failed: ' + e.message, false);
+      }
+      this.restoreBusy = false;
+    },
+
+    fmtBytes(n) {
+      if (n == null) return '—';
+      if (n < 1024) return n + ' B';
+      if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+      return (n / 1024 / 1024).toFixed(1) + ' MB';
     },
 
     fmtDate(ts) {

@@ -19,6 +19,7 @@ Deploy [Hermes Agent](https://github.com/NousResearch/hermes-agent) on [Railway]
 - **User Pairing** — approve or deny users who message your bot, revoke access anytime
 - **Basic Auth** — password-protected admin panel
 - **Reset Config** — one-click reset to start fresh
+- **Backup & Restore** — download a full snapshot (config, credentials, chat history, memories, skills) as a zip, and restore it — including into a fresh project — to clone a deployment. Not encrypted; a safety snapshot is taken automatically before every restore.
 
 ## Getting Started
 
