@@ -8,7 +8,7 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 # newest tag (format `vYYYY.M.D`, optionally with a `.PATCH` suffix, e.g.
 # `v2026.5.29.2`) and update the default below. Use `main` only if you accept
 # that every rebuild can pull arbitrary new upstream commits.
-ARG HERMES_REF=v2026.6.19
+ARG HERMES_REF=v2026.7.1
 
 # tini = tiny init that we run as PID 1. Without it, hermes's grandchild
 # processes (MCP stdio servers, git, bun, browser daemons spawned by tools)
@@ -61,6 +61,21 @@ RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/h
 #   at user request time, and makes first-chat-open instant.
 # - We keep ui-tui/ entirely (node_modules + dist + src) so HERMES_TUI_DIR
 #   can point at it (see below).
+
+# Stamp the CODE-SCOPED install method next to the running package. hermes'
+# detect_install_method() reads <install-tree>/.install_method FIRST (priority 1,
+# authoritative) — before the home-scoped $HERMES_HOME/.install_method that
+# start.sh writes (priority 2, honored only when is_container() is true). The
+# install tree for our editable install is /opt/hermes-agent (parent of
+# hermes_cli/, i.e. Path(config.py).parent.parent). Baking the stamp here makes
+# the dashboard "Update Hermes" button refuse regardless of runtime container
+# detection — exactly what upstream's own published image does (it bakes a
+# docker stamp into /opt/hermes). Belt-and-suspenders with start.sh's home stamp:
+# if a future hermes release changes or drops is_container()'s Railway marker
+# (/run/.containerenv), the home stamp would stop being honored but this one
+# still refuses. Re-verify the install-tree path if hermes stops installing
+# editable from /opt/hermes-agent.
+RUN printf 'docker\n' > /opt/hermes-agent/.install_method
 
 COPY requirements.txt /app/requirements.txt
 RUN uv pip install --system --no-cache -r /app/requirements.txt

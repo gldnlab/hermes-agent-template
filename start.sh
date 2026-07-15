@@ -5,9 +5,18 @@ set -e
 # and seed a default config.yaml if the volume is empty. Without these,
 # `hermes dashboard` endpoints that hit logs/, sessions/, cron/, etc. can fail
 # with opaque errors even though no auth is actually involved.
+# NOTE (hermes >= v2026.7.1): several dirs were consolidated and are now
+# resolved via get_hermes_dir("<new>", "<old>"), which returns the NEW path
+# unless the OLD one already has *content*. Seeding an empty legacy stub no
+# longer "claims" it — hermes ignores empty stubs and writes to the new path
+# (upstream #27602). So we seed the NEW paths: pairing -> platforms/pairing,
+# image_cache -> cache/images, audio_cache -> cache/audio. A populated legacy
+# dir from a pre-v2026.7.1 deploy still wins on both sides, so no migration is
+# needed. server.py:_resolve_pairing_dir() mirrors this same rule for the
+# admin panel's Users tab — keep the two in sync on future bumps.
 mkdir -p /data/.hermes/cron /data/.hermes/sessions /data/.hermes/logs \
-         /data/.hermes/memories /data/.hermes/skills /data/.hermes/pairing \
-         /data/.hermes/hooks /data/.hermes/image_cache /data/.hermes/audio_cache \
+         /data/.hermes/memories /data/.hermes/skills /data/.hermes/platforms/pairing \
+         /data/.hermes/hooks /data/.hermes/cache/images /data/.hermes/cache/audio \
          /data/.hermes/workspace /data/.hermes/skins /data/.hermes/plans \
          /data/.hermes/home
 

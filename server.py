@@ -33,8 +33,11 @@ import json
 import os
 import re
 import secrets
+import shutil
 import signal
+import tempfile
 import time
+import zipfile
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -43,8 +46,11 @@ import httpx
 import websockets
 import websockets.exceptions
 from starlette.applications import Starlette
+from starlette.background import BackgroundTask
+from starlette.datastructures import UploadFile
 from starlette.requests import Request
 from starlette.responses import (
+    FileResponse,
     HTMLResponse,
     JSONResponse,
     RedirectResponse,
@@ -59,13 +65,50 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 ENV_FILE = Path(HERMES_HOME) / ".env"
-PAIRING_DIR = Path(HERMES_HOME) / "pairing"
+
+
+def _resolve_pairing_dir() -> Path:
+    """Locate the pairing store the same way hermes' get_hermes_dir() does.
+
+    hermes resolves ``PAIRING_DIR = get_hermes_dir("platforms/pairing", "pairing")``:
+    it honours the legacy ``$HERMES_HOME/pairing/`` ONLY when that dir has
+    content, otherwise it uses the consolidated ``platforms/pairing/``. The rule
+    changed in **v2026.7.1** — before it (v2026.6.19 and earlier) get_hermes_dir
+    used a bare ``old_path.exists()``, so an *empty* ``pairing/`` (which start.sh
+    used to seed on every boot) counted as "legacy in use" and both sides agreed
+    on ``pairing/``. v2026.7.1 switched to ``_legacy_path_has_content()``, which
+    ignores an empty stub (upstream #27602): the gateway now writes pending/
+    approved files to ``platforms/pairing/`` while a hard-coded ``pairing/`` here
+    would read the wrong (empty) dir — pending users vanish and approvals land
+    where the gateway never looks. We mirror the exact rule so this admin panel
+    and the gateway never split-brain: a *populated* legacy dir wins (preserves a
+    pre-v2026.7.1 deployment's approved users with no migration), else the new
+    consolidated path. Re-verify this against get_hermes_dir on the next bump.
+    """
+    legacy = Path(HERMES_HOME) / "pairing"
+    try:
+        if legacy.is_dir() and any(legacy.iterdir()):
+            return legacy
+    except OSError:
+        # Can't inspect (e.g. permissions) — assume occupied rather than risk
+        # orphaning legacy data, matching hermes' _legacy_path_has_content.
+        return legacy
+    return Path(HERMES_HOME) / "platforms" / "pairing"
+
+
+PAIRING_DIR = _resolve_pairing_dir()
 PAIRING_TTL = 3600
 
 # Native Hermes dashboard — runs on loopback, fronted by our reverse proxy.
 HERMES_DASHBOARD_HOST = "127.0.0.1"
 HERMES_DASHBOARD_PORT = int(os.environ.get("HERMES_DASHBOARD_PORT", "9119"))
 HERMES_DASHBOARD_URL = f"http://{HERMES_DASHBOARD_HOST}:{HERMES_DASHBOARD_PORT}"
+
+# Header hermes' own SPA uses to present its per-process session token
+# (hermes_cli/web_server.py's _SESSION_HEADER_NAME) — see
+# set_active_model_via_hermes()/_get_hermes_session_token() for why our own
+# server-to-server calls to the dashboard need it even on our loopback bind.
+_SESSION_TOKEN_HEADER = "X-Hermes-Session-Token"
 
 # Mirror dashboard-ref-only/auth_proxy.py: strip only `host` (httpx sets it)
 # and `transfer-encoding` (httpx recomputes it from the body). Keep everything
@@ -155,6 +198,79 @@ ENV_VARS = [
 
 SECRET_KEYS  = {k for k, _, _, s in ENV_VARS if s}
 PROVIDER_KEYS = [k for k, _, c, _ in ENV_VARS if c == "provider"]
+
+# Maps our own provider-key env var to hermes' OWN canonical provider id
+# (hermes_cli/auth.py PROVIDER_REGISTRY, verified against v2026.7.1). Used by
+# set_active_model_via_hermes() to pin an explicit model.provider via hermes'
+# own POST /api/model/set instead of leaving config.yaml on "auto" once 2+
+# provider keys exist in .env — see write_config_yaml()'s docstring for why
+# "auto" alone is unsafe with multiple providers configured. Several ids are
+# non-obvious renames upstream (dashscope->alibaba, glm->zai, kimi->kimi-coding,
+# hf->huggingface, ollama->ollama-cloud) — re-verify every entry against
+# hermes_cli/auth.py on a Hermes version bump (same audit as the WS allowlist).
+HERMES_PROVIDER_IDS = {
+    "OPENROUTER_API_KEY":    "openrouter",
+    "DEEPSEEK_API_KEY":      "deepseek",
+    "DASHSCOPE_API_KEY":     "alibaba",       # "Qwen Cloud" in hermes' own UI
+    "GLM_API_KEY":           "zai",           # "Z.AI / GLM"
+    "KIMI_API_KEY":          "kimi-coding",
+    "MINIMAX_API_KEY":       "minimax",
+    "HF_TOKEN":              "huggingface",
+    "NVIDIA_API_KEY":        "nvidia",
+    "ARCEEAI_API_KEY":       "arcee",
+    "STEPFUN_API_KEY":       "stepfun",
+    "GEMINI_API_KEY":        "gemini",
+    "ANTHROPIC_API_KEY":     "anthropic",
+    "XAI_API_KEY":           "xai",
+    "AWS_ACCESS_KEY_ID":     "bedrock",
+    "COPILOT_GITHUB_TOKEN":  "copilot",
+    "GMI_API_KEY":           "gmi",
+    "OPENCODE_ZEN_API_KEY":  "opencode-zen",
+    "OPENCODE_GO_API_KEY":   "opencode-go",
+    "KILOCODE_API_KEY":      "kilocode",
+    "OLLAMA_API_KEY":        "ollama-cloud",
+    "AZURE_FOUNDRY_API_KEY": "azure-foundry",
+    # These three are NOT in hermes' own PROVIDER_REGISTRY — verified against
+    # BOTH hermes_cli/auth.py (resolve_provider(), used by the CLI/"auto"
+    # env-var auto-detect loop) AND hermes_cli/runtime_provider.py
+    # (resolve_runtime_provider(), what the gateway/embedded Chat tab actually
+    # call at agent-init) at v2026.7.1. Neither ever discovers them: "auto"
+    # only scans PROVIDER_REGISTRY's known env vars (these aren't in it, so
+    # they're invisible to it, full stop), and pinning one of these strings
+    # as an explicit provider id raises "Unknown provider '<id>'" — both
+    # produce a dead agent ("No inference provider configured" / "Unknown
+    # provider"), confirmed live for a 9Router custom-endpoint deployment.
+    # The only way any of them work is the same mechanism hermes' OWN
+    # dashboard uses for a self-hosted/aggregator endpoint: provider="custom"
+    # plus an explicit base_url + api_key written onto model.* directly
+    # (hermes_cli/runtime_provider.py's bare-"custom" trust path reads
+    # model.base_url/model.api_key from the model block — it does NOT consult
+    # config.yaml's custom_providers[] list for this, that list is display/
+    # bookkeeping only). See CUSTOM_STYLE_BASE_URLS and
+    # set_active_model_via_hermes(). Re-verify FIREWORKS_API_KEY/NOVITA_API_KEY
+    # base URLs against those providers' own docs (not hermes') if they ever
+    # change their API surface.
+    "CUSTOM_PROVIDER_API_KEY": "custom",   # base_url is user-supplied (CUSTOM_PROVIDER_BASE_URL) — any OpenAI-compatible endpoint, e.g. 9Router
+    "FIREWORKS_API_KEY":       "custom",
+    "NOVITA_API_KEY":          "custom",
+}
+
+# Fixed base URLs for the "custom"-style providers above whose credential is a
+# plain API key against a well-known OpenAI-compatible endpoint. Absent here
+# (CUSTOM_PROVIDER_API_KEY) means the base_url is user-supplied instead — see
+# CUSTOM_PROVIDER_BASE_URL.
+CUSTOM_STYLE_BASE_URLS = {
+    "FIREWORKS_API_KEY": "https://api.fireworks.ai/inference/v1",
+    "NOVITA_API_KEY":    "https://api.novita.ai/openai/v1",
+}
+
+# Every ENV_VARS "provider" key pinned to the literal "custom" id above.
+# Computed, not hand-maintained, so a future provider added to
+# HERMES_PROVIDER_IDS with value "custom" is automatically covered by both
+# api_config_put()'s pin call and write_config_yaml()'s fallback below —
+# no other code needs to change.
+HERMES_CUSTOM_STYLE_KEYS = {k for k, v in HERMES_PROVIDER_IDS.items() if v == "custom"}
+
 CHANNEL_MAP  = {
     "Telegram":    "TELEGRAM_BOT_TOKEN",
     "Discord":     "DISCORD_BOT_TOKEN",
@@ -183,7 +299,7 @@ def read_env(path: Path) -> dict[str, str]:
     return out
 
 
-def write_config_yaml(data: dict[str, str]) -> None:
+def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> None:
     """Write config.yaml — deep-merge template defaults with any existing user/cron-managed sections.
 
     Previously this overwrote ``$HERMES_HOME/config.yaml`` with a hardcoded template
@@ -218,14 +334,80 @@ def write_config_yaml(data: dict[str, str]) -> None:
     merged = dict(existing)
 
     # Deployment-managed (always authoritative — these reflect the runtime env).
-    merged_model = dict(merged.get("model") if isinstance(merged.get("model"), dict) else {})
-    merged_model["default"] = model
-    # Only force provider="auto" when a known API key is configured. If no
-    # API key is set, the user likely configured an OAuth provider (xai-oauth,
-    # qwen-oauth, etc.) via the dashboard's model picker — preserve that value
-    # so a container restart doesn't revert it to "auto" and break their session.
-    if any(data.get(k) for k in PROVIDER_KEYS):
-        merged_model["provider"] = "auto"
+    if reset_model:
+        # Config reset: wipe the model block to a clean slate. Preserving the old
+        # provider/base_url here would leave stale routing behind (e.g. a lingering
+        # `base_url: https://openrouter.ai/api/v1` that misroutes the next provider
+        # the user configures). Everything else — hermes tuning defaults,
+        # mcp_servers — is still deep-merged through untouched below.
+        merged_model = {"default": ""}
+    else:
+        merged_model = dict(merged.get("model") if isinstance(merged.get("model"), dict) else {})
+        merged_model["default"] = model
+        current_provider = str(merged_model.get("provider") or "").strip()
+        # Only default to "auto" on a config that has never had a provider
+        # pinned. Once a provider is set explicitly — either by
+        # set_active_model_via_hermes() below (which delegates to hermes' own
+        # POST /api/model/set) or by hermes' own dashboard — PRESERVE it here.
+        # This function runs on every gateway start (Gateway.start() calls it
+        # fresh from .env every time a subprocess spawns), so unconditionally
+        # forcing "auto" whenever any key is present — the old behavior —
+        # would silently revert an explicit pin back to ambiguous "auto" on
+        # the very next restart. "auto" resolves by scanning hermes' own
+        # PROVIDER_REGISTRY in its OWN dict-insertion order and returning the
+        # first provider with a present env var — independent of which model
+        # string is configured. With exactly one provider key present this is
+        # harmless (only one possible match), but with two or more configured
+        # (e.g. minimax + nvidia) it silently pairs whichever provider sorts
+        # first in that registry with a model string that may belong to a
+        # DIFFERENT provider — the exact bug that made hermes route a
+        # deepseek-v4-pro (NVIDIA) request through MiniMax's own API with an
+        # unrecognized model name, producing a self-contradictory system
+        # prompt and a "confused" identity response.
+        if not current_provider:
+            named_key = next(
+                (k for k in PROVIDER_KEYS if k not in HERMES_CUSTOM_STYLE_KEYS and data.get(k)),
+                None,
+            )
+            custom_style_key = next((k for k in HERMES_CUSTOM_STYLE_KEYS if data.get(k)), None)
+            if named_key:
+                merged_model["provider"] = "auto"
+                current_provider = "auto"
+            elif custom_style_key:
+                # CUSTOM_PROVIDER_API_KEY / FIREWORKS_API_KEY / NOVITA_API_KEY are
+                # NOT in hermes' own PROVIDER_REGISTRY (see HERMES_PROVIDER_IDS'
+                # comment) — "auto" can never discover them, so defaulting to
+                # "auto" here (the old behavior) left the agent with no usable
+                # provider whenever one of these was the ONLY key configured.
+                # This is the synchronous safety net for the async
+                # set_active_model_via_hermes() pin in api_config_put(): this
+                # function also runs directly from .env on every gateway boot
+                # (Gateway.start()), so it must independently produce a
+                # resolvable config even if that pin call never ran or failed.
+                merged_model["provider"] = "custom"
+                merged_model["base_url"] = (
+                    CUSTOM_STYLE_BASE_URLS.get(custom_style_key)
+                    or data.get("CUSTOM_PROVIDER_BASE_URL", "").strip()
+                )
+                merged_model["api_key"] = data.get(custom_style_key, "").strip()
+                current_provider = "custom"
+        # A known built-in provider (openrouter, minimax, nvidia, …) resolves
+        # its endpoint + credentials from the provider itself, so any inline
+        # model.base_url/api_key/api_mode is stale. base_url "takes precedence
+        # over provider" upstream (hermes_cli/config.py), so a leftover — e.g.
+        # a former `base_url: https://openrouter.ai/api/v1` from the hermes
+        # dashboard — silently misroutes EVERY provider you later switch to
+        # (all calls forced to that endpoint regardless of the active model).
+        # Strip them here, mirroring hermes' own clear_model_endpoint_credentials()
+        # on a switch-away-from-custom. Skipped only for "custom"/"local" —
+        # hermes' own convention for a user-supplied (or fixed-URL aggregator)
+        # endpoint that legitimately needs its own base_url/api_key set
+        # directly on model.* (see the "custom_style_key" branch above —
+        # hermes' runtime resolver reads model.base_url/api_key directly, NOT
+        # the separate custom_providers[] block below, which is display-only).
+        if current_provider and current_provider.lower() not in ("custom", "local"):
+            for _stale in ("base_url", "api_key", "api", "api_mode"):
+                merged_model.pop(_stale, None)
     merged["model"] = merged_model
 
     merged_terminal = dict(merged.get("terminal") if isinstance(merged.get("terminal"), dict) else {})
@@ -257,6 +439,22 @@ def write_config_yaml(data: dict[str, str]) -> None:
 
     with config_path.open("w") as f:
         yaml.safe_dump(merged, f, sort_keys=False, default_flow_style=False)
+
+
+def build_hermes_env() -> dict[str, str]:
+    """Merge OS env + HERMES_HOME + .env file contents for a hermes subprocess.
+
+    .env values take priority over Railway env vars. We build the env this way
+    so hermes's own dotenv loading (which reads the same file) doesn't shadow
+    our values. Shared by every hermes subprocess we spawn (gateway, dashboard)
+    — a subprocess started without this (e.g. via a bare env=None, which just
+    inherits our own process env from container boot) never sees provider keys
+    saved later through the setup wizard, since those only ever land in
+    HERMES_HOME/.env, not in our own os.environ.
+    """
+    env = {**os.environ, "HERMES_HOME": HERMES_HOME}
+    env.update(read_env(ENV_FILE))
+    return env
 
 
 def write_env(path: Path, data: dict[str, str]) -> None:
@@ -784,20 +982,32 @@ class Gateway:
         self.state = "starting"
         self._stopping = False
         try:
-            # .env values take priority over Railway env vars.
-            # We build the env this way so hermes's own dotenv loading
-            # (which reads the same file) doesn't shadow our values.
-            env = {**os.environ, "HERMES_HOME": HERMES_HOME}
-            env.update(read_env(ENV_FILE))
+            env = build_hermes_env()
             model = env.get("LLM_MODEL", "")
             provider_key = next((env.get(k, "") for k in PROVIDER_KEYS if env.get(k)), "")
             print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
-            # Write config.yaml so hermes picks up the model (env vars alone aren't always enough)
-            write_config_yaml(read_env(ENV_FILE))
+            # The setup UI manages only the default profile's config. Named
+            # profiles keep their own config under profiles/<name>/.
+            if not self.profile:
+                write_config_yaml(read_env(ENV_FILE))
+
             cmd = ["hermes"]
             if self.profile:
                 cmd += ["-p", self.profile]
-            cmd += ["gateway"]
+            cmd += ["gateway", "run", "--replace"]
+            # --replace: force-displace any existing gateway.pid lock holder
+            # before claiming it. Without this, a lock left behind by a prior
+            # incarnation this supervisor doesn't recognize as "our" dead
+            # process (e.g. hermes' own dashboard spawns its own detached
+            # `hermes gateway restart` via its native /api/gateway/restart
+            # action, entirely outside this class's tracking) makes every
+            # subsequent plain `hermes gateway` invocation refuse to start
+            # ("Another gateway instance is already running"), which
+            # _clear_stale_pidfile() can never self-heal since it only clears
+            # a pid file matching the exact pid THIS supervisor just watched
+            # die. --replace is hermes' own blessed fix for exactly this
+            # class of stuck-lock — it force-kills whatever holds the lock
+            # (graceful SIGTERM, escalating to SIGKILL) before claiming it.
             self.proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -873,7 +1083,11 @@ class Gateway:
             return
         if self.proc and self.proc.returncode is None:
             return  # a manual Start already brought a live gateway back
-        if not is_config_complete():
+        profile_env = (
+            Path(HERMES_HOME) / "profiles" / self.profile / ".env"
+            if self.profile else ENV_FILE
+        )
+        if not (profile_env.exists() if self.profile else is_config_complete()):
             self.state = "stopped"
             self.logs.append("[gateway] restart skipped — provider/model not configured")
             return
@@ -888,7 +1102,11 @@ class Gateway:
     def _clear_stale_pidfile(self, dead_pid: int | None) -> None:
         if dead_pid is None:
             return
-        pid_file = Path(HERMES_HOME) / "gateway.pid"
+        gateway_home = (
+            Path(HERMES_HOME) / "profiles" / self.profile
+            if self.profile else Path(HERMES_HOME)
+        )
+        pid_file = gateway_home / "gateway.pid"
         try:
             rec = json.loads(pid_file.read_text())
         except Exception:
@@ -928,6 +1146,16 @@ class Dashboard:
     The dashboard is independent of the gateway: it reads config files
     directly and tolerates a stopped gateway.
 
+    Spawned with the same merged env (OS env + HERMES_HOME + .env contents)
+    as the gateway — see build_hermes_env(). Without it, the dashboard process
+    only ever sees our own os.environ from container boot, before any
+    provider key exists; the embedded Chat tab's agent-init then fails with
+    "No inference provider configured" even though /setup shows a key saved,
+    because hermes' own provider auto-resolution (hermes_cli/auth.py) reads
+    credentials via plain os.getenv(), not by re-parsing .env from disk. Since
+    the dashboard only starts once at boot, restart() must be called whenever
+    a provider key is saved so the running process picks up the new env.
+
     All subprocess output is streamed to our stdout (→ Railway logs) with a
     `[dashboard]` prefix AND retained in a ring buffer for diagnostics.
     Unexpected exits are explicitly logged with their return code.
@@ -961,6 +1189,7 @@ class Dashboard:
                 # so the PTY child spawns instantly on first chat connect.
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                env=build_hermes_env(),
             )
             print(f"[dashboard] spawned pid={self.proc.pid} → {HERMES_DASHBOARD_URL}", flush=True)
             self._drain_task = asyncio.create_task(self._drain())
@@ -994,6 +1223,17 @@ class Dashboard:
             self.proc.kill()
             await self.proc.wait()
 
+    async def restart(self):
+        """Respawn so a freshly-saved provider key reaches the embedded Chat tab.
+
+        Drops any live /api/pty, /api/ws, /api/events connections (the
+        reverse-proxy WS pumps just see the upstream close and the SPA
+        reconnects) — an acceptable trade-off since the alternative is Chat
+        staying broken until a full redeploy.
+        """
+        await self.stop()
+        await self.start()
+
 
 dash = Dashboard()
 
@@ -1010,6 +1250,116 @@ def get_http_client() -> httpx.AsyncClient:
             follow_redirects=False,
         )
     return _http_client
+
+
+_HERMES_SESSION_TOKEN_RE = re.compile(r'__HERMES_SESSION_TOKEN__\s*=\s*"([^"]*)"')
+
+
+async def _get_hermes_session_token() -> str:
+    """Scrape the dashboard's own ephemeral session token from its SPA shell.
+
+    Hermes gates every non-public ``/api/*`` route behind a per-process
+    random ``_SESSION_TOKEN`` — a legacy check in hermes_cli/web_server.py's
+    ``auth_middleware`` that's SEPARATE from (and still active alongside) the
+    OAuth gate that invariant 3 already covers. Loopback bind only turns off
+    the OAuth gate (``auth_required``); it does not exempt this token check.
+    A tokenless call like a plain server-to-server POST 401s unconditionally.
+
+    The only way to obtain a valid token without a browser is the same way
+    the SPA itself does: on a loopback (ungated) bind, hermes injects it into
+    every served HTML shell as ``window.__HERMES_SESSION_TOKEN__="..."``
+    (hermes_cli/web_server.py's ``_serve_index``). That HTML-serving catch-all
+    route is not under ``/api/``, so it is never itself gated — no chicken-
+    and-egg problem. Not cached: cheap (one loopback GET), and self-heals
+    across a dashboard restart (which rotates the token) without needing
+    invalidation logic. Re-verify the injected variable name against
+    hermes_cli/web_server.py on a Hermes version bump — if it's ever renamed
+    or removed, this degrades to the pre-existing "no token" 401 handled
+    below, not a crash.
+    """
+    client = get_http_client()
+    resp = await client.get(f"{HERMES_DASHBOARD_URL}/", timeout=httpx.Timeout(10.0))
+    resp.raise_for_status()
+    match = _HERMES_SESSION_TOKEN_RE.search(resp.text)
+    return match.group(1) if match else ""
+
+
+async def set_active_model_via_hermes(
+    provider_id: str, model: str, *, base_url: str = "", api_key: str = ""
+) -> str | None:
+    """Pin model.provider + model.default via hermes' own POST /api/model/set.
+
+    Delegates to hermes_cli/web_server.py's _apply_main_model_assignment — the
+    same code path its dashboard's "Switch Model" dialog and flat Config page
+    use — instead of us hand-writing config.yaml's model block. Hermes always
+    resolves an EXPLICIT provider there (never "auto") and correctly clears
+    stale base_url/api_key only on a genuine provider switch, preserving them
+    on a same-provider re-pick.
+
+    Necessary because our own /setup wizard has a single shared "LLM Model"
+    field across every configured provider: once 2+ provider keys exist in
+    .env, config.yaml's model.provider="auto" (write_config_yaml()'s old
+    unconditional default) lets hermes resolve to the WRONG provider — the
+    first match in its own internal PROVIDER_REGISTRY dict order — paired
+    with a model string that belongs to a DIFFERENT provider.
+
+    base_url/api_key are forwarded verbatim into this same request's own
+    ``base_url``/``api_key`` fields (hermes_cli/web_server.py's
+    ``ModelAssignment`` schema — "Only honored for custom/local providers on
+    the main slot"). REQUIRED for provider_id="custom": hermes' actual
+    runtime resolver (hermes_cli/runtime_provider.py, what the gateway/Chat
+    tab call at agent-init) only trusts a bare "custom" provider when
+    model.base_url is ALSO set directly on the model block — it never
+    consults config.yaml's separate custom_providers[] list (that's
+    display/bookkeeping only, for hermes' own Keys-tab picker). Passing them
+    lets hermes write model.base_url/model.api_key itself; it also
+    auto-registers a matching custom_providers catalog entry as a side
+    effect, mirroring its own dashboard's custom-endpoint flow.
+
+    Best-effort: on any failure (dashboard not up yet, network hiccup, no
+    session token obtainable) we leave whatever write_config_yaml() already
+    wrote in place (single-provider "auto" default, or a previously-pinned
+    provider preserved as-is) rather than blocking the save. Returns a
+    human-readable warning string on failure, or None on success.
+    """
+    client = get_http_client()
+    try:
+        session_token = await _get_hermes_session_token()
+    except httpx.HTTPError as e:
+        return f"Could not fetch a Hermes session token to pin {provider_id} ({e}); using auto-resolution instead."
+    headers = {_SESSION_TOKEN_HEADER: session_token} if session_token else {}
+
+    try:
+        resp = await client.post(
+            f"{HERMES_DASHBOARD_URL}/api/model/set",
+            json={
+                "scope": "main",
+                "provider": provider_id,
+                "model": model,
+                "base_url": base_url,
+                "api_key": api_key,
+                # We have no UI to show hermes' own "this model looks
+                # expensive, are you sure?" confirmation — the user already
+                # confirmed intent by pasting a key and a model name here.
+                "confirm_expensive_model": True,
+            },
+            headers=headers,
+            timeout=httpx.Timeout(15.0),
+        )
+    except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
+        return f"Could not reach the Hermes dashboard to pin {provider_id} ({e}); using auto-resolution instead."
+    except httpx.RequestError as e:
+        return f"Hermes model/set request failed ({e}); using auto-resolution instead."
+
+    if resp.status_code != 200:
+        return f"Hermes rejected the {provider_id} model/provider pin (HTTP {resp.status_code}); using auto-resolution instead."
+    try:
+        data = resp.json()
+    except Exception:
+        return None  # 200 with an unparseable body — nothing actionable to report
+    if data.get("ok") is False:
+        return data.get("confirm_message") or f"Hermes did not apply the {provider_id} model/provider pin; using auto-resolution instead."
+    return None
 
 
 # ── Route handlers ────────────────────────────────────────────────────────────
@@ -1038,6 +1388,11 @@ async def api_config_put(request: Request):
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
     try:
         restart = body.pop("_restart", False)
+        # Set by the setup wizard to the ENV_VARS key of whichever provider's
+        # dropdown entry was selected in this save action (e.g. "NVIDIA_API_KEY")
+        # — empty when the user saved without touching a provider (e.g. just
+        # toggling a messaging channel). See set_active_model_via_hermes().
+        active_provider_key = str(body.pop("_active_provider_key", "") or "").strip()
         new_vars = body.get("vars", {})
         async with cfg_lock:
             existing = read_env(ENV_FILE)
@@ -1047,9 +1402,33 @@ async def api_config_put(request: Request):
                     merged[k] = v
             write_env(ENV_FILE, merged)
             write_config_yaml(merged)
+
+        model_warning = None
+        hermes_provider_id = HERMES_PROVIDER_IDS.get(active_provider_key)
+        model_value = merged.get("LLM_MODEL", "").strip()
+        if hermes_provider_id and model_value:
+            pin_base_url = ""
+            pin_api_key = ""
+            if hermes_provider_id == "custom":
+                pin_base_url = (
+                    CUSTOM_STYLE_BASE_URLS.get(active_provider_key)
+                    or merged.get("CUSTOM_PROVIDER_BASE_URL", "").strip()
+                )
+                pin_api_key = merged.get(active_provider_key, "").strip()
+            model_warning = await set_active_model_via_hermes(
+                hermes_provider_id, model_value, base_url=pin_base_url, api_key=pin_api_key
+            )
+
         if restart:
             asyncio.create_task(gw.restart())
-        return JSONResponse({"ok": True, "restarting": restart})
+            # The dashboard (and its embedded Chat tab) only ever sees the env
+            # it was spawned with — a newly-saved provider key doesn't reach
+            # the already-running process otherwise. See Dashboard.restart().
+            asyncio.create_task(dash.restart())
+        resp = {"ok": True, "restarting": restart}
+        if model_warning:
+            resp["warning"] = model_warning
+        return JSONResponse(resp)
     except Exception as e:
         return JSONResponse({"error": str(e)}, status_code=500)
 
@@ -1098,7 +1477,7 @@ async def api_config_reset(request: Request):
     async with cfg_lock:
         if ENV_FILE.exists():
             ENV_FILE.unlink()
-        write_config_yaml({})
+        write_config_yaml({}, reset_model=True)
     return JSONResponse({"ok": True})
 
 
@@ -1206,6 +1585,233 @@ async def api_pairing_revoke(request: Request):
         del approved[uid]
         _wjson(p, approved)
     return JSONResponse({"ok": True})
+
+
+# ── Backup & Restore ─────────────────────────────────────────────────────────
+# Thin wrapper around hermes' OWN `hermes backup` / `hermes import` CLI
+# (hermes_cli/backup.py, verified against v2026.7.1) rather than reimplementing
+# file selection: it already excludes code checkouts/caches/venvs/lock files
+# from the walk, protects against zip-slip on extract, and — critically — skips
+# re-writing gateway_state.json/gateway.pid/cron.pid/gateway.lock/processes.json
+# even when present in the archive (_IMPORT_SKIP_NAMES). That's exactly the
+# "don't let a foreign pid file wedge the supervisor" concern invariant 6
+# already documents — we deliberately do not duplicate either behavior
+# ourselves. Re-verify both on a future Hermes version bump, same as every
+# other upstream-CLI assumption this template makes.
+BACKUP_DIR = Path(HERMES_HOME) / "backups"   # hermes' own pre-update-backup convention;
+                                              # this dir is itself in hermes' backup
+                                              # exclusion list, so snapshots here never
+                                              # bloat a future full backup.
+PRE_RESTORE_KEEP = 3
+BACKUP_SUBPROCESS_TIMEOUT = 600  # 10 min ceiling for both `hermes backup` and `hermes import`
+SNAPSHOT_NAME_RE = re.compile(r"^pre-restore-\d+-[0-9a-f]+\.zip$")
+
+backup_lock = asyncio.Lock()
+
+
+async def _run_hermes_cli(*args: str, timeout: float = BACKUP_SUBPROCESS_TIMEOUT) -> tuple[int, str]:
+    """Run a `hermes <args>` subcommand, capturing combined stdout+stderr.
+
+    Shares build_hermes_env() with Gateway/Dashboard so the CLI sees provider
+    keys saved via /setup (not just our own os.environ). Never raises — like
+    Gateway.start()/Dashboard.start(), a failed spawn (missing binary, bad env)
+    is reported as a (rc, message) pair so every caller gets one uniform error
+    shape instead of an unhandled exception surfacing as a generic 500.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "hermes", *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+            env=build_hermes_env(),
+        )
+    except OSError as e:
+        return 127, f"Could not launch hermes {' '.join(args)}: {e}"
+    try:
+        raw, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return 124, f"hermes {' '.join(args)} timed out after {timeout}s"
+    return proc.returncode, raw.decode(errors="replace")
+
+
+async def _hermes_version() -> str:
+    """Best-effort `hermes --version`, used only for the restore-time compat hint."""
+    try:
+        rc, out = await _run_hermes_cli("--version", timeout=15)
+        return out.strip() if rc == 0 else "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _prune_pre_restore_snapshots() -> None:
+    snaps = sorted(BACKUP_DIR.glob("pre-restore-*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)
+    for stale in snaps[PRE_RESTORE_KEEP:]:
+        try:
+            stale.unlink()
+        except OSError:
+            pass
+
+
+def _sweep_stale_backup_tmpdirs() -> None:
+    """Clean up /tmp/hermes-backup-* left behind by a client aborting a download
+    mid-stream (the BackgroundTask cleanup then never runs). Safe: this prefix
+    is only ever used by api_backup_download, and /tmp is ephemeral anyway —
+    this just bounds growth across many downloads within one long-lived container.
+    """
+    for stale in Path(tempfile.gettempdir()).glob("hermes-backup-*"):
+        shutil.rmtree(stale, ignore_errors=True)
+
+
+async def api_backup_download(request: Request) -> Response:
+    if err := guard(request): return err
+    if backup_lock.locked():
+        return JSONResponse({"error": "A backup or restore is already in progress"}, status_code=409)
+    async with backup_lock:
+        tmp_dir = tempfile.mkdtemp(prefix="hermes-backup-")
+        zip_path = Path(tmp_dir) / "backup.zip"
+        rc, output = await _run_hermes_cli("backup", "-o", str(zip_path))
+        if rc != 0 or not zip_path.exists():
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return JSONResponse({"error": "Backup failed", "output": output[-2000:]}, status_code=500)
+
+        # Best-effort manifest entry for the restore-time version hint — never
+        # fails the download if this step errors.
+        try:
+            version = await _hermes_version()
+            with zipfile.ZipFile(zip_path, "a") as zf:
+                zf.writestr("template_manifest.json", json.dumps({
+                    "hermes_version": version,
+                    "created_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                    "template": "hermes-agent-railway-template",
+                }))
+        except Exception:
+            pass
+
+        filename = f"hermes-backup-{int(time.time())}.zip"
+        return FileResponse(
+            zip_path,
+            filename=filename,
+            media_type="application/zip",
+            background=BackgroundTask(shutil.rmtree, tmp_dir, ignore_errors=True),
+        )
+
+
+async def api_backup_snapshots(request: Request) -> Response:
+    if err := guard(request): return err
+    out = []
+    if BACKUP_DIR.exists():
+        for p in sorted(BACKUP_DIR.glob("pre-restore-*.zip"), key=lambda p: p.stat().st_mtime, reverse=True):
+            st = p.stat()
+            out.append({"name": p.name, "size": st.st_size, "created_at": st.st_mtime})
+    return JSONResponse({"snapshots": out})
+
+
+async def api_backup_snapshot_download(request: Request) -> Response:
+    if err := guard(request): return err
+    name = request.path_params.get("name", "")
+    if not SNAPSHOT_NAME_RE.match(name):
+        return Response("Not Found", status_code=404, media_type="text/plain")
+    path = BACKUP_DIR / name
+    try:
+        path.resolve().relative_to(BACKUP_DIR.resolve())
+    except ValueError:
+        return Response("Not Found", status_code=404, media_type="text/plain")
+    if not path.is_file():
+        return Response("Not Found", status_code=404, media_type="text/plain")
+    return FileResponse(path, filename=name, media_type="application/zip")
+
+
+async def api_backup_restore(request: Request) -> Response:
+    if err := guard(request): return err
+    if backup_lock.locked():
+        return JSONResponse({"error": "A backup or restore is already in progress"}, status_code=409)
+
+    form = await request.form()
+    upload = form.get("file")
+    if not isinstance(upload, UploadFile):
+        return JSONResponse({"error": "No file uploaded"}, status_code=400)
+
+    async with backup_lock:
+        tmp_fd, tmp_name = tempfile.mkstemp(suffix=".zip", prefix="hermes-restore-")
+        upload_path = Path(tmp_name)
+        try:
+            with os.fdopen(tmp_fd, "wb") as f:
+                while chunk := await upload.read(1024 * 1024):
+                    f.write(chunk)
+
+            if not zipfile.is_zipfile(upload_path):
+                return JSONResponse({"error": "Uploaded file is not a valid zip archive"}, status_code=400)
+
+            warning = None
+            with zipfile.ZipFile(upload_path) as zf:
+                names = {Path(n).name for n in zf.namelist()}
+                if not names & {"config.yaml", ".env", "state.db"}:
+                    return JSONResponse(
+                        {"error": "This doesn't look like a hermes backup (no config.yaml/.env/state.db found)"},
+                        status_code=400,
+                    )
+                if "template_manifest.json" in names:
+                    try:
+                        manifest = json.loads(zf.read("template_manifest.json"))
+                        backup_version = manifest.get("hermes_version", "")
+                        current_version = await _hermes_version()
+                        if backup_version and current_version != "unknown" and backup_version != current_version:
+                            warning = (
+                                f"Backup was created with hermes {backup_version}, this deployment runs "
+                                f"{current_version} — some settings may not carry over cleanly."
+                            )
+                    except Exception:
+                        pass
+
+            # Safety snapshot BEFORE touching anything live — abort rather than
+            # overwrite state with no undo copy behind it.
+            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            # secrets suffix avoids a same-second collision silently clobbering
+            # a distinct prior snapshot (two restores fired back-to-back).
+            snap_path = BACKUP_DIR / f"pre-restore-{int(time.time())}-{secrets.token_hex(4)}.zip"
+            rc, output = await _run_hermes_cli("backup", "-o", str(snap_path))
+            if rc != 0:
+                return JSONResponse(
+                    {"error": "Could not create the pre-restore safety snapshot; restore aborted.",
+                     "output": output[-2000:]},
+                    status_code=500,
+                )
+            _prune_pre_restore_snapshots()
+
+            await asyncio.gather(
+                gw.stop(),
+                *[eg.stop() for eg in extra_gateways],
+            )
+            await dash.stop()
+            try:
+                rc, output = await _run_hermes_cli("import", str(upload_path), "--force")
+            finally:
+                # Always bring the dashboard back; only auto-start the gateway if
+                # the (possibly just-restored) config is actually complete — same
+                # rule auto_start() uses on boot. This runs even if the import
+                # itself failed, so a bad upload doesn't leave the bot down too.
+                await dash.start()
+                if is_config_complete():
+                    await gw.start()
+                await asyncio.gather(*[
+                    eg.start()
+                    for eg in extra_gateways
+                    if (Path(HERMES_HOME) / "profiles" / eg.profile / ".env").exists()
+                ])
+
+            if rc != 0:
+                return JSONResponse({"error": "Restore failed", "output": output[-2000:]}, status_code=500)
+
+            resp = {"ok": True, "output": output[-2000:]}
+            if warning:
+                resp["warning"] = warning
+            return JSONResponse(resp)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+        finally:
+            upload_path.unlink(missing_ok=True)
 
 
 # ── Reverse proxy → Hermes dashboard ──────────────────────────────────────────
@@ -1362,6 +1968,7 @@ async def auto_start():
 
 @asynccontextmanager
 async def lifespan(app):
+    _sweep_stale_backup_tmpdirs()
     # Dashboard runs always — it's the user-facing UI after setup is done,
     # and it's independent of gateway state.
     asyncio.create_task(dash.start())
@@ -1559,6 +2166,10 @@ routes = [
     Route("/setup/api/oauth/xai/start",         api_oauth_xai_start,  methods=["POST"]),
     Route("/setup/api/oauth/xai/status",        api_oauth_xai_status),
     Route("/setup/api/oauth/xai",               api_oauth_xai_delete, methods=["DELETE"]),
+    Route("/setup/api/backup/download",         api_backup_download),
+    Route("/setup/api/backup/restore",          api_backup_restore,  methods=["POST"]),
+    Route("/setup/api/backup/snapshots",        api_backup_snapshots),
+    Route("/setup/api/backup/snapshots/{name}", api_backup_snapshot_download),
 
     # /setup/* typos return a real 404 — not a silent proxy fallthrough.
     Route("/setup/{path:path}",                 route_setup_404,     methods=ANY_METHOD),
@@ -1599,6 +2210,8 @@ if __name__ == "__main__":
 
     def _shutdown():
         loop.create_task(gw.stop())
+        for eg in extra_gateways:
+            loop.create_task(eg.stop())
         loop.create_task(dash.stop())
         server.should_exit = True
 
