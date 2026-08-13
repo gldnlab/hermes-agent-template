@@ -66,6 +66,13 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 ENV_FILE = Path(HERMES_HOME) / ".env"
 
+# The Hermes release this image pins. The Dockerfile promotes its `ARG
+# HERMES_REF` to an ENV so we can read it here; a Railway service variable of
+# the same name (the documented way to pin an older release) shadows that ENV,
+# so this always reflects what actually got built rather than a hardcoded
+# string that would go stale — or worse, misreport after a deliberate rollback.
+HERMES_VERSION = os.environ.get("HERMES_REF", "").strip()
+
 
 def _resolve_pairing_dir() -> Path:
     """Locate the pairing store the same way hermes' get_hermes_dir() does.
@@ -96,7 +103,72 @@ def _resolve_pairing_dir() -> Path:
     return Path(HERMES_HOME) / "platforms" / "pairing"
 
 
-PAIRING_DIR = _resolve_pairing_dir()
+def pairing_dir() -> Path:
+    """Resolve the pairing store on every call — never cache it at import.
+
+    `/setup/api/backup/restore` shells out to `hermes import`, which can create
+    a *populated* legacy ``pairing/`` mid-process. That flips the dir hermes
+    itself resolves (gateway/pairing.py's ``PAIRING_DIR``), so a value frozen at
+    import would leave this admin panel reading the dir the gateway abandoned:
+    pending users invisible, approvals written where nothing reads them, until
+    the next container restart. Costs two stat calls per request.
+    """
+    return _resolve_pairing_dir()
+
+
+def _consolidate_pairing_dirs() -> None:
+    """Union the inactive pairing dir into the active one, then clear it.
+
+    hermes >= v2026.7.20 added ``_migrate_split_pairing_dirs()``
+    (gateway/pairing.py), which copies the inactive dir into the active one on
+    EVERY ``PairingStore()`` construction and never prunes the source. A revoke
+    therefore only clears the active copy and is silently resurrected from the
+    stale one on the next gateway boot — a de-authorized user regains access
+    while this panel shows them removed. hermes' own ``revoke()`` has the same
+    hole, so calling its API instead would not help; the fix is to make sure a
+    second populated dir never survives.
+
+    Only `/setup/api/backup/restore` can create that split here (start.sh seeds
+    only the consolidated path), so we run this after a restore and once at
+    boot to heal deployments split by an earlier restore.
+
+    Safety: the active dir always wins on key conflict (matching hermes'
+    ``_merge_pairing_dir``), and the alternate's files are removed only after
+    the union has been written. Deleting them cannot flip the resolution —
+    when legacy is active it stays populated; when it is not active it is empty
+    by definition.
+    """
+    active = _resolve_pairing_dir()
+    legacy = Path(HERMES_HOME) / "pairing"
+    consolidated = Path(HERMES_HOME) / "platforms" / "pairing"
+    try:
+        alternate = legacy if active.resolve() == consolidated.resolve() else consolidated
+    except OSError:
+        return
+    if not alternate.is_dir():
+        return
+    for src in sorted(alternate.glob("*.json")):
+        if not src.is_file():
+            continue
+        stale = _pjson(src)
+        if not stale:
+            # Empty, or unreadable (_pjson swallows a parse error as {}). Either
+            # way there is nothing to merge — and we do NOT delete it, because a
+            # corrupt file may still be recoverable by hand. An empty leftover
+            # is inert: hermes' own merge skips it too.
+            continue
+        dest = active / src.name
+        merged = dict(stale)
+        merged.update(_pjson(dest))   # live entries win
+        try:
+            _wjson(dest, merged)
+        except OSError as e:
+            print(f"[pairing] consolidate failed for {src.name}: {e}", flush=True)
+            continue          # leave the source intact — never drop the only copy
+        src.unlink(missing_ok=True)
+        print(f"[pairing] consolidated {src.name}: {alternate} -> {active}", flush=True)
+
+
 PAIRING_TTL = 3600
 
 # Native Hermes dashboard — runs on loopback, fronted by our reverse proxy.
@@ -136,6 +208,11 @@ ENV_VARS = [
     ("GLM_API_KEY",              "GLM / Z.AI",               "provider",  True),
     ("KIMI_API_KEY",             "Kimi",                     "provider",  True),
     ("MINIMAX_API_KEY",          "MiniMax",                  "provider",  True),
+    # MiniMax runs two separate platforms with separate accounts and keys:
+    # global (api.minimax.io) and China (api.minimaxi.com). Hermes ships both as
+    # first-class providers, so a CN key is a normal provider entry here — no
+    # custom-endpoint plumbing needed, and both can be configured at once.
+    ("MINIMAX_CN_API_KEY",       "MiniMax (China)",          "provider",  True),
     ("HF_TOKEN",                 "Hugging Face",             "provider",  True),
     # Added in v2026.4.23+ (hermes v0.11.0+). All plain API-key auth — hermes
     # auto-routes by env-var presence, no extra config needed on our side.
@@ -198,6 +275,8 @@ ENV_VARS = [
 
 SECRET_KEYS  = {k for k, _, _, s in ENV_VARS if s}
 PROVIDER_KEYS = [k for k, _, c, _ in ENV_VARS if c == "provider"]
+# Display names for the admin UI, straight from the registry above.
+ENV_LABELS = {k: l for k, l, _, _ in ENV_VARS}
 
 # Maps our own provider-key env var to hermes' OWN canonical provider id
 # (hermes_cli/auth.py PROVIDER_REGISTRY, verified against v2026.7.1). Used by
@@ -215,6 +294,7 @@ HERMES_PROVIDER_IDS = {
     "GLM_API_KEY":           "zai",           # "Z.AI / GLM"
     "KIMI_API_KEY":          "kimi-coding",
     "MINIMAX_API_KEY":       "minimax",
+    "MINIMAX_CN_API_KEY":    "minimax-cn",    # China platform (api.minimaxi.com)
     "HF_TOKEN":              "huggingface",
     "NVIDIA_API_KEY":        "nvidia",
     "ARCEEAI_API_KEY":       "arcee",
@@ -420,6 +500,19 @@ def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> Non
     merged_agent.setdefault("max_iterations", 50)
     merged["agent"] = merged_agent
 
+    # Pin the conversation auto-reset policy so it doesn't depend on volume age.
+    # start.sh seeds cli-config.yaml.example only on a FRESH volume, and
+    # v2026.7.20 flipped that example (and SessionResetPolicy's own default)
+    # from "both" to "none" — so without this an existing deployment keeps
+    # resetting while a newly deployed one never does, from identical code.
+    # We keep "both" (idle + daily): it bounds context growth and preserves the
+    # agent's one turn to persist memories/skills before a wipe.
+    # setdefault, not assignment — unlike terminal.backend this is a user
+    # preference, so a value chosen in hermes' own settings survives.
+    merged_session_reset = dict(merged.get("session_reset") if isinstance(merged.get("session_reset"), dict) else {})
+    merged_session_reset.setdefault("mode", "both")
+    merged["session_reset"] = merged_session_reset
+
     merged["data_dir"] = HERMES_HOME
 
     # Custom OpenAI-compatible endpoint — write custom_providers block when configured,
@@ -454,6 +547,26 @@ def build_hermes_env() -> dict[str, str]:
     """
     env = {**os.environ, "HERMES_HOME": HERMES_HOME}
     env.update(read_env(ENV_FILE))
+    # Retire hermes' own respawn-storm breaker (new in v2026.7.20,
+    # hermes_cli/gateway.py `run_gateway`): once >5 starts land in a rolling
+    # 120s window it BLOCKS with time.sleep() before the gateway boots, counted
+    # in a persistent ledger ($HERMES_HOME/gateway-starts.log) that this
+    # supervisor can neither see nor reset. It duplicates our own crash-loop
+    # guard (RESPAWN_MAX_IN_WIN/RESPAWN_WINDOW_S) — except ours deliberately
+    # clears its budget on a manual Start/Restart, so six quick /setup saves
+    # during first-run setup would otherwise stall the gateway ~10s with the bot
+    # offline while Gateway.start() has already reported "running" and /health
+    # 200s. `HERMES_GATEWAY_MAX_STARTS` is upstream's documented escape hatch:
+    # <= 0 skips the check and the ledger write entirely. setdefault so a
+    # Railway service variable or .env can still re-enable it.
+    env.setdefault("HERMES_GATEWAY_MAX_STARTS", "0")
+    # v2026.8.3's `agent.restart_after_turn_timeout` (default 21600) makes
+    # /restart wait for the active turn, so a wedged turn leaves the bot alive,
+    # /health 200 and refusing every message for up to 6h. `0` is upstream's
+    # documented disable and restores v2026.7.20's immediate drain. Read before
+    # config.yaml, and inherited by all three restart paths (in-band, SIGUSR1,
+    # and the dashboard's detached restart). setdefault: set e.g. 120 to re-arm.
+    env.setdefault("HERMES_RESTART_AFTER_TURN_TIMEOUT", "0")
     return env
 
 
@@ -1029,7 +1142,14 @@ class Gateway:
         self.state = "stopping"
         self.proc.terminate()
         try:
-            await asyncio.wait_for(self.proc.wait(), timeout=10)
+            # 20s, not 10s: tearing down several messaging adapters (Telegram +
+            # Discord + Slack polling loops, each draining in-flight sends) can
+            # outrun 10s, and SIGKILL mid-teardown skips hermes' atexit pid
+            # cleanup — which is exactly the leftover _clear_stale_pidfile()
+            # then has to mop up. Still well inside hermes' own drain+60s
+            # shutdown watchdog, and `--replace` on the next start displaces
+            # anything that did survive, so waiting longer costs only latency.
+            await asyncio.wait_for(self.proc.wait(), timeout=20)
         except asyncio.TimeoutError:
             self.proc.kill()
             await self.proc.wait()
@@ -1436,8 +1556,12 @@ async def api_config_put(request: Request):
 async def api_status(request: Request):
     if err := guard(request): return err
     data = read_env(ENV_FILE)
+    # Label from the ENV_VARS registry rather than munging the env-var name.
+    # Deriving it produced things like "Minimax Cn" and "Glm" while the registry
+    # already carries the proper display name; a new provider now reads correctly
+    # on the Status page without another string-replace being bolted on here.
     providers = {
-        k.replace("_API_KEY","").replace("_TOKEN","").replace("HF_","HuggingFace ").replace("_"," ").title():
+        (ENV_LABELS.get(k) or k.replace("_API_KEY", "").replace("_TOKEN", "").replace("_", " ").title()):
         {"configured": bool(data.get(k))}
         for k in PROVIDER_KEYS
     }
@@ -1445,7 +1569,8 @@ async def api_status(request: Request):
         name: {"configured": bool(v := data.get(key,"")) and v.lower() not in ("false","0","no")}
         for name, key in CHANNEL_MAP.items()
     }
-    return JSONResponse({"gateway": gw.status(), "providers": providers, "channels": channels})
+    return JSONResponse({"gateway": gw.status(), "providers": providers,
+                         "channels": channels, "hermes_version": HERMES_VERSION})
 
 
 async def api_logs(request: Request):
@@ -1508,8 +1633,9 @@ def _wjson(path: Path, data: dict):
 
 
 def _platforms(suffix: str) -> list[str]:
-    if not PAIRING_DIR.exists(): return []
-    return [f.stem.rsplit(f"-{suffix}", 1)[0] for f in PAIRING_DIR.glob(f"*-{suffix}.json")]
+    d = pairing_dir()
+    if not d.exists(): return []
+    return [f.stem.rsplit(f"-{suffix}", 1)[0] for f in d.glob(f"*-{suffix}.json")]
 
 
 async def api_pairing_pending(request: Request):
@@ -1517,7 +1643,7 @@ async def api_pairing_pending(request: Request):
     now = time.time()
     out = []
     for p in _platforms("pending"):
-        for code, info in _pjson(PAIRING_DIR / f"{p}-pending.json").items():
+        for code, info in _pjson(pairing_dir() / f"{p}-pending.json").items():
             if now - info.get("created_at", now) <= PAIRING_TTL:
                 out.append({"platform": p, "code": code,
                             "user_id": info.get("user_id",""), "user_name": info.get("user_name",""),
@@ -1532,7 +1658,7 @@ async def api_pairing_approve(request: Request):
     platform, code = body.get("platform",""), body.get("code","").strip()
     if not platform or not code:
         return JSONResponse({"error": "platform and code required"}, status_code=400)
-    pending_path = PAIRING_DIR / f"{platform}-pending.json"
+    pending_path = pairing_dir() / f"{platform}-pending.json"
     pending = _pjson(pending_path)
     if code not in pending:
         return JSONResponse({"error": "Code not found"}, status_code=404)
@@ -1543,9 +1669,10 @@ async def api_pairing_approve(request: Request):
         # haven't written the pop yet) rather than silently discarding it.
         return JSONResponse({"error": "Pending entry has no user_id"}, status_code=422)
     _wjson(pending_path, pending)
-    approved = _pjson(PAIRING_DIR / f"{platform}-approved.json")
+    approved_path = pairing_dir() / f"{platform}-approved.json"
+    approved = _pjson(approved_path)
     approved[user_id] = {"user_name": entry.get("user_name",""), "approved_at": time.time()}
-    _wjson(PAIRING_DIR / f"{platform}-approved.json", approved)
+    _wjson(approved_path, approved)
     return JSONResponse({"ok": True})
 
 
@@ -1554,7 +1681,7 @@ async def api_pairing_deny(request: Request):
     try: body = await request.json()
     except Exception: return JSONResponse({"error": "Invalid JSON"}, status_code=400)
     platform, code = body.get("platform",""), body.get("code","").strip()
-    p = PAIRING_DIR / f"{platform}-pending.json"
+    p = pairing_dir() / f"{platform}-pending.json"
     pending = _pjson(p)
     if code in pending:
         del pending[code]
@@ -1566,7 +1693,7 @@ async def api_pairing_approved(request: Request):
     if err := guard(request): return err
     out = []
     for p in _platforms("approved"):
-        for uid, info in _pjson(PAIRING_DIR / f"{p}-approved.json").items():
+        for uid, info in _pjson(pairing_dir() / f"{p}-approved.json").items():
             out.append({"platform": p, "user_id": uid,
                         "user_name": info.get("user_name",""), "approved_at": info.get("approved_at",0)})
     return JSONResponse({"approved": out})
@@ -1579,7 +1706,7 @@ async def api_pairing_revoke(request: Request):
     platform, uid = body.get("platform",""), body.get("user_id","")
     if not platform or not uid:
         return JSONResponse({"error": "platform and user_id required"}, status_code=400)
-    p = PAIRING_DIR / f"{platform}-approved.json"
+    p = pairing_dir() / f"{platform}-approved.json"
     approved = _pjson(p)
     if uid in approved:
         del approved[uid]
@@ -1664,6 +1791,32 @@ def _sweep_stale_backup_tmpdirs() -> None:
         shutil.rmtree(stale, ignore_errors=True)
 
 
+def _incomplete_backup_reason(zip_path: Path) -> str | None:
+    """Why `zip_path` is not a trustworthy backup, or None when it looks sound.
+
+    `rc == 0` stopped proving that in hermes v2026.7.20: `_safe_copy_db`
+    (hermes_cli/backup.py) lost its raw-copy fallback and now fails CLOSED, so a
+    SQLite snapshot that can't be taken is DROPPED from the archive while
+    `hermes backup` still exits 0 — the only trace is the word "incomplete" in
+    its summary. That matters most for the pre-restore safety snapshot, the one
+    copy standing between a bad restore and permanent data loss.
+
+    We inspect the artifact rather than grepping the summary text, so an
+    upstream reword can't silently disable the guard. state.db is required only
+    when the live deployment actually has one — a bot that has never held a
+    conversation legitimately has no session DB yet, and must still be able to
+    back up.
+    """
+    try:
+        with zipfile.ZipFile(zip_path) as zf:
+            names = {Path(n).name for n in zf.namelist()}
+    except Exception as e:
+        return f"the archive could not be read back ({e})"
+    if (Path(HERMES_HOME) / "state.db").exists() and "state.db" not in names:
+        return "state.db (sessions and chat history) is missing from the archive"
+    return None
+
+
 async def api_backup_download(request: Request) -> Response:
     if err := guard(request): return err
     if backup_lock.locked():
@@ -1690,10 +1843,19 @@ async def api_backup_download(request: Request) -> Response:
             pass
 
         filename = f"hermes-backup-{int(time.time())}.zip"
+        headers = {}
+        # Surface a partial archive instead of handing over a file the user
+        # would only discover is incomplete when a restore fails. Warn rather
+        # than block: config, keys and memories are still worth exporting even
+        # when the session DB could not be snapshotted.
+        if reason := _incomplete_backup_reason(zip_path):
+            print(f"[backup] incomplete archive — {reason}", flush=True)
+            headers["X-Backup-Warning"] = f"Backup is incomplete: {reason}."
         return FileResponse(
             zip_path,
             filename=filename,
             media_type="application/zip",
+            headers=headers,
             background=BackgroundTask(shutil.rmtree, tmp_dir, ignore_errors=True),
         )
 
@@ -1772,9 +1934,16 @@ async def api_backup_restore(request: Request) -> Response:
             # a distinct prior snapshot (two restores fired back-to-back).
             snap_path = BACKUP_DIR / f"pre-restore-{int(time.time())}-{secrets.token_hex(4)}.zip"
             rc, output = await _run_hermes_cli("backup", "-o", str(snap_path))
-            if rc != 0:
+            # rc alone is no longer sufficient — see _incomplete_backup_reason().
+            # A snapshot missing state.db is not an undo copy, so treat it the
+            # same as a failed one and refuse to touch live state.
+            snap_problem = _incomplete_backup_reason(snap_path) if rc == 0 else None
+            if rc != 0 or snap_problem:
+                detail = snap_problem or "the backup command failed"
+                snap_path.unlink(missing_ok=True)
                 return JSONResponse(
-                    {"error": "Could not create the pre-restore safety snapshot; restore aborted.",
+                    {"error": f"Could not create a complete pre-restore safety snapshot ({detail}); "
+                              f"restore aborted so nothing is overwritten without an undo copy.",
                      "output": output[-2000:]},
                     status_code=500,
                 )
@@ -1788,6 +1957,14 @@ async def api_backup_restore(request: Request) -> Response:
             try:
                 rc, output = await _run_hermes_cli("import", str(upload_path), "--force")
             finally:
+                # An imported archive can carry the legacy `pairing/` layout,
+                # which leaves two populated pairing dirs. Collapse them before
+                # anything reads the store again — hermes' own merge would
+                # otherwise keep resurrecting revoked users from the leftover.
+                try:
+                    _consolidate_pairing_dirs()
+                except Exception as e:
+                    print(f"[pairing] consolidate after restore failed: {e!r}", flush=True)
                 # Always bring the dashboard back; only auto-start the gateway if
                 # the (possibly just-restored) config is actually complete — same
                 # rule auto_start() uses on boot. This runs even if the import
@@ -1828,6 +2005,51 @@ BACK_TO_SETUP_WIDGET = (
     f'<a href="/setup" style="{_WIDGET_LINK_STYLE}">← Setup</a>'
     f'<a href="/logout" style="{_WIDGET_LINK_STYLE}">Sign out</a>'
     '</div>'
+)
+
+# Dashboard actions that install into the running container. Tools -> post-setup
+# (hermes_cli/web_routers/tools.py) npm/pip-installs into /opt/hermes-agent and
+# is just as ephemeral as the memory-provider path, but shipped with no warning.
+# MCP catalog install is deliberately NOT here: it installs under
+# $HERMES_HOME/mcp-installs on the volume, so it does survive a redeploy.
+_IN_CONTAINER_INSTALL_RE = re.compile(
+    r"^/api/(?:memory/providers/[^/]+/setup|tools/toolsets/[^/]+/post-setup)$"
+)
+
+# Warn before any dashboard action that installs into the RUNNING container.
+# Neither endpoint carries an install-method check, so the `.install_method=docker`
+# stamp (invariant 4) does not refuse them, and on Railway the image is immutable:
+# the package disappears on the next redeploy while config.yaml still names it.
+# Only the PACKAGE is lost — settings live in config.yaml/.env on the volume — so
+# re-running the install fully restores it, which is what the notice says. We warn
+# rather than block so a quick trial stays possible, and point at a GitHub issue
+# rather than the Dockerfile, since most people deploy this without a fork.
+IMMUTABLE_INSTALL_WARNING_JS = (
+    '<script>(function(){'
+    'var f=window.fetch;if(!f||window.__hermesImmutableWarn)return;'
+    'window.__hermesImmutableWarn=1;'
+    'window.fetch=function(input,init){try{'
+    'var u=(typeof input==="string")?input:(input&&input.url)||"";'
+    'var m=((init&&init.method)||(input&&input.method)||"GET").toUpperCase();'
+    'if(m==="POST"&&/\\/api\\/(memory\\/providers\\/[^\\/]+\\/setup|tools\\/toolsets\\/[^\\/]+\\/post-setup)/.test(u)&&'
+    '!window.confirm("MESSAGE FROM THE TEMPLATE CREATOR\\n'
+    '----------------------------------------\\n\\n'
+    'This template is deployed on Railway as an immutable container: the image is '
+    'rebuilt from scratch on every deploy, so anything installed into the running '
+    'container is wiped.\\n\\n'
+    'Installing this will work right now, but only until your next deploy. '
+    'After that it stays configured while its package is gone, and the agent '
+    'fails to start it.\\n\\n'
+    'If that happens, just install it again from here — your settings and API '
+    'keys are stored on the Railway volume, not inside the container, so '
+    'nothing needs reconfiguring and it resumes where it left off.\\n\\n'
+    'To have it included permanently, please raise an issue here:\\n'
+    'https://github.com/praveen-ks-2001/hermes-agent-template/issues\\n\\n'
+    'It will be reviewed and built into the template, so next time it works out '
+    'of the box with no install step.\\n\\n'
+    'Install anyway (temporary)?"))'
+    '{return Promise.reject(new Error("Cancelled: immutable deployment"));}'
+    '}catch(e){}return f.apply(this,arguments);};})();</script>'
 )
 
 DASHBOARD_UNAVAILABLE_HTML = """<!DOCTYPE html>
@@ -1902,11 +2124,16 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     content = upstream.content
     content_type = upstream.headers.get("content-type", "").lower()
 
-    # Inject the "← Setup" widget into HTML pages so users can always return.
+    # Inject the "← Setup" widget into HTML pages so users can always return,
+    # plus the immutable-install confirm shim (see IMMUTABLE_INSTALL_WARNING_JS).
     if "text/html" in content_type and b"</body>" in content:
         try:
             text = content.decode("utf-8", errors="replace")
-            text = text.replace("</body>", BACK_TO_SETUP_WIDGET + "</body>", 1)
+            text = text.replace(
+                "</body>",
+                BACK_TO_SETUP_WIDGET + IMMUTABLE_INSTALL_WARNING_JS + "</body>",
+                1,
+            )
             content = text.encode("utf-8")
         except Exception:
             pass  # on any error, fall back to raw upstream content
@@ -1939,6 +2166,13 @@ async def route_root(request: Request) -> Response:
 async def route_proxy(request: Request) -> Response:
     """Catch-all: forward any unmatched path to the Hermes dashboard."""
     if err := guard(request): return err
+    # Leave a trail when an in-container install runs: the browser already got
+    # the confirm() from IMMUTABLE_INSTALL_WARNING_JS, but this is the only
+    # record in `railway logs` explaining why a provider works now and breaks
+    # after the next redeploy.
+    if request.method == "POST" and _IN_CONTAINER_INSTALL_RE.match(request.url.path):
+        print(f"[proxy] in-container install requested: {request.url.path} — "
+              f"immutable image, this will not survive a redeploy", flush=True)
     return await _proxy_to_dashboard(request)
 
 
@@ -1969,6 +2203,13 @@ async def auto_start():
 @asynccontextmanager
 async def lifespan(app):
     _sweep_stale_backup_tmpdirs()
+    # Heal a pairing store split across the legacy and consolidated dirs before
+    # anything reads it. Only a restore can create that here, but an earlier
+    # restore (or a volume carried over from a pre-fix deploy) may already have.
+    try:
+        _consolidate_pairing_dirs()
+    except Exception as e:
+        print(f"[pairing] consolidate at boot failed: {e!r}", flush=True)
     # Dashboard runs always — it's the user-facing UI after setup is done,
     # and it's independent of gateway state.
     asyncio.create_task(dash.start())
@@ -1999,6 +2240,14 @@ async def lifespan(app):
 #   /api/pty                  binary stream — embedded TUI keystrokes/output
 #   /api/ws                   JSON-RPC      — gateway sidecar driving Chat metadata
 #   /api/events               text frames   — dashboard subscriber for /api/pub fan-out
+#   /api/console              text frames   — Hermes Console modal (System tab →
+#                             "Open console"), added in v2026.7.20. Same
+#                             pre-accept gates and same ?token= credential as
+#                             /api/pty, so plain forwarding is enough. Without
+#                             this route the button dies on one failed connect
+#                             with "Console connection failed before the server
+#                             handshake" (it does NOT retry, so nothing shows
+#                             up in railway logs).
 #   /api/plugins/<name>/...   plugin-contributed sockets. Mounted by hermes
 #                             under /api/plugins/<name>/ (web_server.
 #                             _mount_plugin_api_routes), e.g. kanban's
@@ -2012,7 +2261,14 @@ async def lifespan(app):
 #   * Upstream: hermes's own ?token=<_SESSION_TOKEN> query param. The SPA
 #     fetches that token via /api/auth/session-token and includes it in the
 #     WS URL, so we just forward path + query verbatim.
-PROXIED_WS_PATHS = ("/api/pty", "/api/ws", "/api/events", "/api/plugins/*")
+PROXIED_WS_PATHS = ("/api/pty", "/api/ws", "/api/events", "/api/console", "/api/plugins/*")
+
+# Mirrors hermes' own ws_max_size (v2026.8.3, web_server.py:362) so this proxy
+# is never the narrow end. Our hops default lower — 1 MiB inbound from hermes,
+# 16 MiB from the browser — and an oversized frame just closes the socket, so
+# Chat/PTY vanishes mid-message with nothing in the logs. Same "both ends must
+# agree" trap as the keepalive pairing below. A cap, not a preallocation.
+HERMES_WS_MAX_BYTES = 384 * 1024 * 1024
 
 
 async def _ws_pump_client_to_upstream(
@@ -2094,6 +2350,20 @@ async def ws_proxy(websocket: WebSocket) -> None:
         upstream = await websockets.connect(
             upstream_url,
             open_timeout=5,
+            # No keepalive on the loopback hop. hermes v2026.7.20 disabled its
+            # own side for a loopback bind (uvicorn ws_ping_interval/timeout
+            # went 30s/60s -> None/None) because a GIL-bound agent turn can
+            # stall its event loop for minutes, and the ping then kills a
+            # healthy socket. It reasoned "loopback means no proxy in front" —
+            # but we ARE that proxy, so leaving the websockets client on its
+            # 20s/20s default would re-create the bug hermes just fixed: a long
+            # tool call drops Chat/sidecar mid-turn. Liveness is unaffected — a
+            # dead hermes closes the socket for real (ConnectionClosed in the
+            # pumps), and the browser-facing hop keeps uvicorn's own ping.
+            ping_interval=None,
+            ping_timeout=None,
+            # hermes -> us leg: the narrower hop, 1 MiB by default.
+            max_size=HERMES_WS_MAX_BYTES,
             # Don't forward client cookies/headers — hermes WS auth is
             # purely token-based via the URL, and forwarding random
             # headers risks future upstream surprises.
@@ -2184,6 +2454,10 @@ routes = [
     WebSocketRoute("/api/pty",                  ws_proxy),
     WebSocketRoute("/api/ws",                   ws_proxy),
     WebSocketRoute("/api/events",               ws_proxy),
+    # Hermes Console modal, new in v2026.7.20 (hermes_cli/web_server.py's
+    # @app.websocket("/api/console")). Fail-closed list, so it 403s at our edge
+    # until listed here — see the PROXIED_WS_PATHS block above.
+    WebSocketRoute("/api/console",              ws_proxy),
     # Plugin-contributed sockets, mounted by hermes under /api/plugins/<name>/
     # (e.g. kanban's /api/plugins/kanban/events). Prefix-matched so new plugin
     # WS endpoints in future hermes releases proxy without re-touching this list.
@@ -2205,7 +2479,9 @@ if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info", loop="asyncio")
+    # ws_max_size: browser -> us leg of the same pairing (uvicorn defaults 16 MiB).
+    config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="info", loop="asyncio",
+                            ws_max_size=HERMES_WS_MAX_BYTES)
     server = uvicorn.Server(config)
 
     def _shutdown():

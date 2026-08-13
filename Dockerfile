@@ -8,7 +8,14 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 # newest tag (format `vYYYY.M.D`, optionally with a `.PATCH` suffix, e.g.
 # `v2026.5.29.2`) and update the default below. Use `main` only if you accept
 # that every rebuild can pull arbitrary new upstream commits.
-ARG HERMES_REF=v2026.7.1
+ARG HERMES_REF=v2026.8.3
+
+# Persist the build arg into the runtime env so the admin UI can display which
+# Hermes release this image actually pins. Reading it (rather than hardcoding a
+# version in the template) keeps the badge honest when someone overrides
+# HERMES_REF as a Railway service variable to pin an older release — a Railway
+# runtime variable simply shadows this ENV, so the UI still shows the truth.
+ENV HERMES_REF=${HERMES_REF}
 
 # tini = tiny init that we run as PID 1. Without it, hermes's grandchild
 # processes (MCP stdio servers, git, bun, browser daemons spawned by tools)
@@ -21,6 +28,10 @@ ARG HERMES_REF=v2026.7.1
 #
 # Node.js is required only at build time to compile the Hermes React dashboard.
 # We strip the source + apt lists afterwards to keep the image lean.
+#
+# Keep setup_22.x. v2026.8.3's new .npmrc sets engine-strict=true, so hermes'
+# `node >=22.22.0` + `npm <11.10.0 || >=11.17.0` is now a hard EBADENGINE build
+# failure, not a warning — setup_24.x bundles an npm that satisfies neither.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends curl ca-certificates git tini && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
@@ -39,6 +50,16 @@ RUN apt-get update && \
 # and bricks the session on Anthropic's non-retryable 400. We bake it in.
 # When bumping HERMES_REF, re-check hermes-agent's pyproject.toml [all] and
 # the extras below against the new release's pyproject.toml.
+#
+# The `-e` is LOAD-BEARING since v2026.8.3: upstream's new setup.py raises on
+# bdist_wheel/sdist unless HERMES_NIX_BUILD=1. PEP 660 editable installs route
+# through build_editable and are exempt — drop `-e` and the image won't build.
+#
+# v2026.8.3 also added [tool.uv] to pyproject.toml, which uv reads from this
+# cwd (upstream builds from a frozen lock; we re-resolve every time):
+# override-dependencies fixes discord.py's vulnerable pynacl pin, and
+# exclude-newer="14 days" can fail a build on a fresh dep — override with
+# `uv pip install --exclude-newer <date>`.
 RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/hermes-agent.git /opt/hermes-agent && \
     cd /opt/hermes-agent && \
     uv pip install --system --no-cache -e ".[all,messaging,tts-premium,honcho,bedrock,anthropic,edge-tts,hindsight,vision]" && \

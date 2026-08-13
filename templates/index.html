@@ -34,7 +34,15 @@
     color: var(--text);
     font-family: var(--font-sans);
     font-size: 14px;
+    /* Mobile browsers resolve 100vh to the LARGE viewport (address bar
+       retracted), which is taller than what is actually on screen while the
+       bar is showing. Combined with overflow:hidden that pushed the save bar —
+       and the sidebar footer — below the fold with no way to scroll to them,
+       so "Save & Start" was unreachable on phones. dvh tracks the visible
+       viewport instead. The 100vh line stays first as the fallback for
+       browsers predating dvh (pre-2022); anything newer overrides it. */
     height: 100vh;
+    height: 100dvh;
     overflow: hidden;
     display: flex;
     flex-direction: column;
@@ -213,6 +221,45 @@
     background: var(--border);
     margin: 8px 16px;
   }
+
+  /* Pinned-Hermes-version badge (sidebar footer). Deliberately quiet: it is
+     reference information, not an action, so it must not compete with the
+     nav items above it. Hover reveals it is clickable -> What's New. */
+  .version-badge {
+    margin: 0 12px 8px;
+    padding: 8px 10px;
+    border: 1px solid var(--border);
+    border-radius: 7px;
+    background: var(--surface2);
+    cursor: pointer;
+    user-select: none;
+    transition: border-color 0.15s;
+  }
+  .version-badge:hover { border-color: var(--accent); }
+  .version-badge-top {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+  }
+  .version-badge-label {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+  .version-badge-value {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--green);
+  }
+  .version-badge-hint {
+    font-size: 10px;
+    color: var(--text-dim);
+    margin-top: 3px;
+  }
+  .version-badge:hover .version-badge-hint { color: var(--accent); }
 
   /* ── Main content ─────────────────────────────────── */
   #main {
@@ -494,6 +541,55 @@
     gap: 12px;
   }
 
+  /* ── Backup drop zone ─────────────────────────────── */
+  .dropzone {
+    display: block;
+    border: 1px dashed var(--border);
+    border-radius: 8px;
+    padding: 22px 16px;
+    text-align: center;
+    cursor: pointer;
+    background: var(--bg);
+    transition: border-color 0.15s, background 0.15s;
+  }
+  .dropzone:hover { border-color: var(--accent); }
+  .dropzone:focus-within { border-color: var(--accent); }
+  .dropzone.dragging {
+    border-color: var(--accent);
+    border-style: solid;
+    background: rgba(98,114,255,0.07);
+  }
+  /* Kept in the layout (not display:none) so it stays keyboard-focusable and
+     clickable natively — clipped rather than hidden. */
+  .dropzone-input {
+    position: absolute;
+    width: 1px; height: 1px;
+    opacity: 0;
+    overflow: hidden;
+  }
+  .dropzone-icon { font-size: 18px; color: var(--text-dim); margin-bottom: 6px; }
+  .dropzone-main { font-size: 13px; color: var(--text); }
+  .dropzone-link { color: var(--accent2); text-decoration: underline; }
+  .dropzone-file { font-family: var(--font-mono); font-size: 12.5px; color: var(--green); word-break: break-all; }
+  .dropzone-sub { font-size: 11.5px; color: var(--text-dim); margin-top: 5px; }
+
+  /* Inline restore outcome — the toast is easy to miss after a long restore. */
+  .restore-result {
+    display: flex;
+    align-items: flex-start;
+    gap: 9px;
+    margin-top: 12px;
+    padding: 10px 13px;
+    border-radius: 7px;
+    font-size: 13px;
+    line-height: 1.5;
+    animation: slideIn 0.2s ease;
+  }
+  .restore-result-icon { font-family: var(--font-mono); font-weight: 600; line-height: 1.4; }
+  .restore-result.ok   { background: rgba(63,185,80,0.10);  border: 1px solid rgba(63,185,80,0.35);  color: var(--green); }
+  .restore-result.warn { background: rgba(210,153,34,0.10); border: 1px solid rgba(210,153,34,0.35); color: var(--yellow); }
+  .restore-result.err  { background: rgba(248,81,73,0.09);  border: 1px solid rgba(248,81,73,0.35);  color: var(--red); }
+
   /* ── Toast ────────────────────────────────────────── */
   #toast {
     position: fixed;
@@ -663,12 +759,44 @@
   .header-branding a:hover { color: var(--accent); }
 
   /* ── Changelog ────────────────────────────────────── */
+  /* Timeline. The left rule runs continuously through every entry; the dot
+     marks the release type — filled accent for a Hermes upgrade (/1), hollow
+     for the template-only follow-ups (/2, /3 …). Everything under the date is
+     indented off the same edge so dates align down one axis and content down
+     another. */
   .changelog-entry {
-    margin-bottom: 24px;
-    padding-bottom: 20px;
-    border-bottom: 1px solid var(--border);
+    position: relative;
+    padding: 0 0 26px 22px;
+    border-left: 1px solid var(--border);
   }
-  .changelog-entry:last-child { border-bottom: none; margin-bottom: 0; padding-bottom: 0; }
+  .changelog-entry:last-child {
+    padding-bottom: 4px;
+    border-left-color: transparent;
+  }
+  .changelog-entry::before {
+    content: '';
+    position: absolute;
+    left: -5.5px;
+    top: 4px;
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    box-sizing: border-box;
+  }
+  /* Hermes version upgrade — the one worth reading before you update. */
+  .changelog-entry.major::before {
+    background: var(--accent);
+    border: 2px solid var(--accent);
+    box-shadow: 0 0 0 3px rgba(98,114,255,0.16);
+  }
+  /* Template-only fixes on the same Hermes version. */
+  .changelog-entry.minor::before {
+    background: var(--surface);
+    border: 2px solid var(--text-dim);
+  }
+  /* Content sits one step in from the date, so the eye gets date -> detail. */
+  .changelog-entry .changelog-group,
+  .changelog-entry .changelog-list { margin-left: 13px; }
   .changelog-date {
     font-family: var(--font-mono);
     font-size: 13px;
@@ -677,6 +805,56 @@
     margin-bottom: 10px;
     letter-spacing: 0.3px;
   }
+  /* Release provenance: which git branch carries this release, and the Hermes
+     version it is pinned to. main tracks the newest; each release also keeps
+     a permanent release/<version> branch so a deployment can stay on an older
+     Hermes. NOTE: meta-box is inline-flex, which collapses plain whitespace
+     between children — spacing must come from `gap`, never from source spaces. */
+  .changelog-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin: 0 0 14px;
+  }
+  /* Release identity lives in the branch name itself (release/<hermes>/<n>),
+     so entries carry no separate major/minor badge. */
+  .meta-box {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 4px 10px;
+  }
+  .meta-label {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+  }
+  .meta-box code {
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text);
+  }
+  .meta-box.version code { color: var(--green); }
+  .meta-sep { color: var(--text-dim); font-size: 11px; }
+
+  /* Grouped release notes: upstream-driven adaptations vs our own fixes. */
+  .changelog-group {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 0.06em;
+    text-transform: uppercase;
+    color: var(--text-dim);
+    margin: 16px 0 8px;
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--border);
+  }
+  .changelog-entry .changelog-group:first-of-type { margin-top: 4px; }
+
   .changelog-list { list-style: none; padding: 0; margin: 0; }
   .changelog-list li {
     position: relative;
@@ -715,12 +893,114 @@
     font-weight: 500;
   }
   .guide-callout a:hover { text-decoration: underline; }
+
+  /* ── Mobile menu toggle (hamburger) ───────────────── */
+  .menu-toggle {
+    display: none;               /* shown only on narrow viewports */
+    background: var(--surface2);
+    border: 1px solid var(--border);
+    color: var(--text);
+    width: 34px;
+    height: 32px;
+    border-radius: 6px;
+    font-size: 16px;
+    line-height: 1;
+    cursor: pointer;
+    flex-shrink: 0;
+    align-items: center;
+    justify-content: center;
+    padding: 0;
+    transition: border-color 0.15s, color 0.15s;
+  }
+  .menu-toggle:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* Overlay behind the off-canvas drawer */
+  #sidebar-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.5);
+    z-index: 40;
+    animation: fadeIn 0.15s ease;
+  }
+  @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
+
+  /* ── Responsive: tablet & below ───────────────────── */
+  @media (max-width: 860px) {
+    /* Sidebar becomes an off-canvas drawer */
+    #sidebar {
+      position: fixed;
+      top: var(--header-h);
+      left: 0;
+      bottom: 0;
+      width: 260px;
+      max-width: 82vw;
+      z-index: 50;
+      transform: translateX(-100%);
+      transition: transform 0.2s ease;
+      box-shadow: 2px 0 16px rgba(0,0,0,0.4);
+    }
+    #sidebar.open { transform: translateX(0); }
+    #sidebar-overlay.open { display: block; }
+
+    .menu-toggle { display: inline-flex; }
+
+    /* Reclaim header space: drop the decorative branding block */
+    .header-branding { display: none; }
+    #header { padding: 0 12px; gap: 10px; }
+    .logo { font-size: 15px; }
+    /* Collapse the "Report issue" link to just its icon */
+    .header-issue-link { font-size: 0; padding: 5px 9px; }
+    .header-issue-link::before { content: '⚠'; font-size: 13px; }
+
+    /* Stack the save bar so its buttons never get pushed off-screen */
+    .save-bar {
+      flex-direction: column;
+      align-items: stretch;
+      padding: 12px 16px;
+    }
+    .save-bar > div { justify-content: stretch; }
+    .save-bar .btn { flex: 1; text-align: center; }
+
+    /* Two-column form/status grids collapse to one column */
+    .field-grid-2 { grid-template-columns: 1fr; }
+
+    .panel-header { padding: 14px 16px 10px; }
+    .panel-body { padding: 16px; }
+  }
+
+  /* ── Responsive: phones ───────────────────────────── */
+  @media (max-width: 560px) {
+    :root { --header-h: 48px; }
+
+    #status-label { display: none; }   /* dot still conveys state */
+
+    /* Status page provider/channel columns stack */
+    .status-split { grid-template-columns: 1fr !important; }
+
+    .stat-grid { grid-template-columns: 1fr 1fr; gap: 10px; }
+    .stat-card { padding: 13px; }
+    .stat-value { font-size: 18px; }
+
+    /* Action buttons go full-width and wrap cleanly */
+    .action-row .btn { flex: 1 1 calc(50% - 5px); }
+
+    .template-grid { grid-template-columns: 1fr; }
+
+    .panel-subtitle { display: none; }  /* keep headers compact */
+
+    /* Pair cards stack their actions below the identity */
+    .pair-card { flex-wrap: wrap; }
+
+    #toast { left: 16px; right: 16px; bottom: 16px; max-width: none; }
+  }
 </style>
 </head>
 <body x-data="app()" x-init="init()" x-cloak>
 
 <!-- Header -->
 <div id="header">
+  <button class="menu-toggle" @click="menuOpen = !menuOpen" aria-label="Toggle navigation menu">☰</button>
   <img src="https://pbs.twimg.com/profile_images/1816254738234761216/TX7TW-Mp_400x400.jpg"
        alt="Hermes" style="width:28px;height:28px;border-radius:6px;flex-shrink:0;">
   <div class="logo">hermes<span>/admin</span></div>
@@ -740,8 +1020,11 @@
 <!-- Layout -->
 <div id="layout">
 
+  <!-- Backdrop for the off-canvas sidebar (mobile only) -->
+  <div id="sidebar-overlay" :class="{open: menuOpen}" @click="menuOpen = false"></div>
+
   <!-- Sidebar -->
-  <nav id="sidebar">
+  <nav id="sidebar" :class="{open: menuOpen}" @click="menuOpen = false">
 
     <div class="nav-group-label">Setup</div>
     <div class="nav-item" :class="{active: page==='setup'}" @click="page='setup'">
@@ -801,7 +1084,22 @@
       <span>Backup &amp; Restore</span>
     </div>
 
-    <div class="nav-divider" style="margin-top:auto;"></div>
+    <!-- Which Hermes release this deployment is pinned to. Lives in the
+         sidebar's flex dead-space (margin-top:auto) so it costs no layout and
+         stays visible on every tab, unlike the already-crowded header. Version
+         comes from the server (HERMES_REF), never hardcoded, so it stays true
+         when someone pins an older release. Clicking opens What's New, where
+         the per-release branch names for rolling back are listed. -->
+    <div class="version-badge" style="margin-top:auto;" @click="page='changelog'"
+         :title="'This template is built and tested against Hermes ' + (hermesVersion || 'unknown') + '. Click to see what changed and how to pin an older version.'">
+      <div class="version-badge-top">
+        <span class="version-badge-label">Hermes</span>
+        <span class="version-badge-value" x-text="hermesVersion || '—'"></span>
+      </div>
+      <div class="version-badge-hint">What's new &amp; older versions →</div>
+    </div>
+
+    <div class="nav-divider"></div>
 
     <div class="nav-item danger" @click="resetConfig()">
       <span class="nav-icon">⊘</span>
@@ -915,13 +1213,15 @@
                      : selectedProvider === 'Anthropic (Claude)' ? 'e.g. claude-sonnet-4-20250514'
                      : selectedProvider === 'AWS Bedrock' ? 'e.g. anthropic.claude-3-5-sonnet-20241022-v2:0'
                      : selectedProvider === 'Fireworks AI' ? 'e.g. accounts/fireworks/models/llama-v3p1-70b-instruct'
+                     : selectedProvider === 'MiniMax' || selectedProvider === 'MiniMax (China)' ? 'e.g. MiniMax-M3'
                      : selectedProvider === 'Custom Endpoint' || selectedProvider === 'Azure Foundry' ? 'model-id as required by the endpoint'
                      : 'e.g. openai/gpt-4o-mini  or  deepseek/deepseek-chat'">
             <p class="hint" x-show="selectedProvider === 'xAI Grok (SuperGrok)' || selectedProvider === 'xAI'">e.g. <code>grok-4.3</code>, <code>grok-4.20-0309-reasoning</code></p>
             <p class="hint" x-show="selectedProvider === 'Anthropic (Claude)'">e.g. <code>claude-sonnet-4-20250514</code>, <code>claude-opus-4-20250115</code></p>
             <p class="hint" x-show="selectedProvider === 'AWS Bedrock'">e.g. <code>anthropic.claude-3-5-sonnet-20241022-v2:0</code>, <code>us.meta.llama3-2-90b-instruct-v1:0</code></p>
             <p class="hint" x-show="selectedProvider === 'Fireworks AI'">Format: <code>accounts/fireworks/models/&lt;model-id&gt;</code></p>
-            <p class="hint" x-show="!['xAI Grok (SuperGrok)','xAI','Anthropic (Claude)','AWS Bedrock','Fireworks AI','Custom Endpoint','Azure Foundry'].includes(selectedProvider) && selectedProvider">Check your provider's docs for model names. OpenRouter format: <code>provider/model-name</code></p>
+            <p class="hint" x-show="selectedProvider === 'MiniMax' || selectedProvider === 'MiniMax (China)'">e.g. <code>MiniMax-M3</code>, <code>MiniMax-M2.7</code></p>
+            <p class="hint" x-show="!['xAI Grok (SuperGrok)','xAI','Anthropic (Claude)','AWS Bedrock','Fireworks AI','MiniMax','MiniMax (China)','Custom Endpoint','Azure Foundry'].includes(selectedProvider) && selectedProvider">Check your provider's docs for model names. OpenRouter format: <code>provider/model-name</code></p>
           </div>
         </div>
 
@@ -1210,7 +1510,7 @@
           <button class="btn"         @click="restartGateway()">↺ Restart</button>
         </div>
 
-        <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
+        <div class="status-split" style="display:grid;grid-template-columns:1fr 1fr;gap:16px;">
           <div>
             <div class="section-label">Providers</div>
             <div class="card" style="padding:0;overflow:hidden;">
@@ -1344,14 +1644,39 @@
             newer user approvals) can be lost. A safety snapshot of the current state is taken
             automatically first — see below if you need to recover it.
           </p>
-          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
-            <input type="file" accept=".zip" @change="restoreFile = $event.target.files[0]" x-ref="restoreInput" style="display:none;">
-            <button class="btn" type="button" @click="$refs.restoreInput.click()">Choose File</button>
-            <span style="font-size:12px;color:var(--text-dim);font-family:var(--font-mono);" x-text="restoreFile ? restoreFile.name : 'No file chosen'"></span>
+          <!-- Drop zone. The file input is a real, focusable control here (not
+               a display:none input driven by a synthetic .click()) because some
+               environments — notably streamed "cloud browsers" — never surface
+               a programmatically opened file dialog, leaving no way to pick a
+               file at all. Dropping and clicking both land in the same
+               setRestoreFile(), so there is one validation path. -->
+          <label class="dropzone" :class="{dragging: restoreDragging}"
+                 @dragenter.prevent.stop="restoreDragging = true"
+                 @dragover.prevent.stop="restoreDragging = true"
+                 @dragleave.prevent.stop="restoreDragging = false"
+                 @drop.prevent.stop="restoreDragging = false; setRestoreFile($event.dataTransfer.files[0])">
+            <input type="file" accept=".zip,application/zip" x-ref="restoreInput"
+                   @change="setRestoreFile($event.target.files[0])"
+                   class="dropzone-input">
+            <div class="dropzone-icon">⬆</div>
+            <div class="dropzone-main">
+              <span x-show="!restoreFile">Drop a backup .zip here, or <span class="dropzone-link">browse</span></span>
+              <span x-show="restoreFile" class="dropzone-file" x-text="restoreFile ? restoreFile.name : ''"></span>
+            </div>
+            <div class="dropzone-sub" x-show="!restoreFile">Only .zip files created by Download Backup</div>
+            <div class="dropzone-sub" x-show="restoreFile" x-text="restoreFile ? fmtBytes(restoreFile.size) + ' — click or drop again to replace' : ''"></div>
+          </label>
+          <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin-top:12px;">
             <button class="btn danger" @click="restoreBackup()" :disabled="restoreBusy || !restoreFile">
               <span x-show="!restoreBusy">⬆ Upload &amp; Restore</span>
               <span x-show="restoreBusy">Restoring…</span>
             </button>
+            <button class="btn" type="button" x-show="restoreFile" @click="clearRestoreFile()">Clear</button>
+          </div>
+          <div class="restore-result" x-show="restoreResult" x-cloak
+               :class="restoreResult && restoreResult.ok ? 'ok' : (restoreResult && restoreResult.warn ? 'warn' : 'err')">
+            <span class="restore-result-icon" x-text="restoreResult && restoreResult.ok ? '✓' : (restoreResult && restoreResult.warn ? '!' : '✕')"></span>
+            <span x-text="restoreResult ? restoreResult.msg : ''"></span>
           </div>
         </div>
 
@@ -1471,8 +1796,129 @@
       </div>
       <div class="panel-body">
 
-        <div class="changelog-entry">
+        <div style="background:rgba(98,114,255,0.06);border:1px solid rgba(98,114,255,0.2);border-radius:8px;padding:12px 15px;margin-bottom:20px;font-size:13px;color:var(--text-dim);line-height:1.6;">
+          <div style="margin-bottom:8px;">
+            <code>main</code> always ships the <strong style="color:var(--text);">latest</strong> release — that is what you get by default.
+            To stay on, or roll back to, a particular Hermes version, point your Railway service at that release's branch and redeploy.
+          </div>
+          <div>
+            Release branches are named <code>release/&lt;hermes-version&gt;/&lt;n&gt;</code>.
+            <code>/1</code> is where that Hermes version first landed; <code>/2</code>, <code>/3</code> and so on are
+            template-only fixes and improvements on top of it — the Hermes version never changes within a series.
+            <strong style="color:var(--text);">Pick the highest number</strong> for the Hermes version you want; each branch stays put once published.
+          </div>
+        </div>
+
+        <div class="changelog-entry major">
+          <div class="changelog-date">August 8, 2026</div>
+          <div class="changelog-meta">
+            <span class="meta-box">
+              <span class="meta-label">Git branch</span>
+              <code>release/v2026.8.3/1</code>
+            </span>
+            <span class="meta-box version">
+              <span class="meta-label">Hermes compatible version</span>
+              <code>v2026.8.3</code>
+            </span>
+          </div>
+
+          <div class="changelog-group">Hermes update</div>
+          <ul class="changelog-list">
+            <li>Updated <strong>Hermes Agent to v2026.8.3</strong> (from v2026.7.20, covering two upstream releases) — adds video generation tools, the <strong>Vercel AI Gateway</strong> and <strong>Vertex</strong> providers, outbound webhooks, and gateway health monitoring.</li>
+            <li><strong>Fewer out-of-memory restarts</strong> — Hermes now returns unused memory to the system as it runs, which directly targets the crashes that hit long-running bots.</li>
+            <li><strong>An interrupted message is retried automatically.</strong> If your bot is killed mid-answer (an out-of-memory crash, or a redeploy), Hermes now re-runs that message when it comes back instead of losing it. Left enabled — but if the message asked for something with real-world side effects, it will be carried out a second time.</li>
+          </ul>
+
+          <div class="changelog-group">Changes to support upstream updates</div>
+          <ul class="changelog-list">
+            <li><strong>Restart no longer parks the bot.</strong> Hermes changed <code>/restart</code> to wait for the current task to finish first — up to <strong>six hours</strong> — and during that wait the bot stays online, shows as healthy, and refuses every message. Restored to restarting straight away, as it did before.</li>
+            <li><strong>Long replies and large output no longer cut the Chat tab.</strong> Hermes raised its WebSocket message limit to 384&nbsp;MB while this proxy still stopped at 1&nbsp;MB, so anything bigger silently dropped the connection mid-message with no error anywhere. Both ends now match.</li>
+            <li><strong>Unexpected restart during very heavy tasks.</strong> Hermes added a watchdog that restarts the gateway if it stops responding for about two minutes. Kept on — this template already restarts the gateway cleanly — but a genuinely heavy task can now end in a restart rather than a reply.</li>
+            <li><strong>Build pinned against upstream's new checks.</strong> Hermes now fails the build outright on the wrong Node.js version and blocks non-editable installs; both are pinned and documented so a future change can't quietly break the image.</li>
+          </ul>
+
+          <div class="changelog-group">Improvements</div>
+          <ul class="changelog-list">
+            <li><strong>The "this won't survive a redeploy" notice now also covers the Tools tab.</strong> Installing a toolset from the dashboard wipes on the next deploy just like a memory provider, but used to warn you about neither — only the provider button did. Both now warn, and re-installing still restores everything, since your settings and keys live on the volume.</li>
+          </ul>
+        </div>
+
+        <div class="changelog-entry minor">
+          <div class="changelog-date">July 30, 2026</div>
+          <div class="changelog-meta">
+            <span class="meta-box">
+              <span class="meta-label">Git branch</span>
+              <code>release/v2026.7.20/2</code>
+            </span>
+            <span class="meta-box version">
+              <span class="meta-label">Hermes compatible version</span>
+              <code>v2026.7.20</code>
+            </span>
+          </div>
+
+          <div class="changelog-group">Bug fixes</div>
+          <ul class="changelog-list">
+            <li>Fixed <strong>Choose file</strong> doing nothing when restoring a backup on streamed "cloud" browsers, which never show the file dialog the old picker relied on (<a href="https://github.com/praveen-ks-2001/hermes-agent-template/issues/76" target="_blank" rel="noopener" style="color:var(--accent2);">#76</a>).</li>
+          </ul>
+
+          <div class="changelog-group">Improvements</div>
+          <ul class="changelog-list">
+            <li><strong>Backup restore</strong> — drag a .zip straight onto the Restore box, and see the outcome (success, warning, or why it failed) in the box itself rather than a brief pop-up.</li>
+            <li><strong>MiniMax (China)</strong> is now in the provider dropdown alongside the global one — separate platforms with separate keys, so you can set up either or both. Model hints added for both.</li>
+          </ul>
+        </div>
+
+        <div class="changelog-entry major">
+          <div class="changelog-date">July 27, 2026</div>
+          <div class="changelog-meta">
+            <span class="meta-box">
+              <span class="meta-label">Git branch</span>
+              <code>release/v2026.7.20/1</code>
+            </span>
+            <span class="meta-box version">
+              <span class="meta-label">Hermes compatible version</span>
+              <code>v2026.7.20</code>
+            </span>
+          </div>
+
+          <div class="changelog-group">Hermes update</div>
+          <ul class="changelog-list">
+            <li>Updated <strong>Hermes Agent to v2026.7.20</strong> (from v2026.7.1) — adds the new <strong>Hermes Console</strong>, session export, and three new providers: <strong>Fireworks AI</strong>, <strong>DeepInfra</strong> and <strong>Upstage Solar</strong>.</li>
+          </ul>
+
+          <div class="changelog-group">Changes to support upstream updates</div>
+          <ul class="changelog-list">
+            <li><strong>Hermes Console.</strong> Hermes added a new console connection; this template only forwards connections it explicitly knows about, so the button failed. Added it to that list.</li>
+            <li><strong>Restart throttling.</strong> Hermes added its own restart brake that paused the gateway before starting it — on top of the one this template already has. Turned Hermes' off so only ours applies; saving settings repeatedly no longer takes the bot offline.</li>
+            <li><strong>Backups.</strong> Hermes can now leave your chat history out of a backup while still reporting success. The template now checks the file itself: a restore is refused unless its automatic safety snapshot is complete, and downloads warn instead of quietly handing you a partial file.</li>
+            <li><strong>Paired users.</strong> Hermes now re-copies old pairing data on every start, which brought revoked users back. The template merges the old and new locations into one after a restore, so a revoke stays revoked.</li>
+            <li><strong>Long replies.</strong> Hermes stopped sending keep-alive pings on its internal connection; this template was still expecting them and cut Chat off mid-reply. Matched Hermes' behaviour.</li>
+            <li><strong>MCP sign-in.</strong> Hermes builds its return address from the web address it sees, which is internal behind this template's proxy. The template now tells Hermes its real public URL.</li>
+            <li><strong>Memory providers.</strong> Hermes added a button that installs software into the running container, with no check for immutable deployments. The template now warns first — anything installed this way is lost on the next deploy.</li>
+            <li><strong>Conversation auto-reset.</strong> Hermes changed its default, which would have made newly created deployments behave differently from existing ones. The template now sets it explicitly so both match.</li>
+          </ul>
+
+          <div class="changelog-group">Bug fixes</div>
+          <ul class="changelog-list">
+            <li>Fixed the <strong>Users</strong> tab reading the wrong location after a restore — pairing requests could be invisible and approvals ignored until the next restart.</li>
+            <li>Gateway shutdown now waits longer, so several connected chat platforms can disconnect cleanly instead of being cut off.</li>
+          </ul>
+        </div>
+
+        <div class="changelog-entry major">
           <div class="changelog-date">July 13, 2026</div>
+          <div class="changelog-meta">
+            <!-- Predates the release/<version> convention, so it keeps its
+                 original branch name rather than being retro-renamed. -->
+            <span class="meta-box">
+              <span class="meta-label">Git branch</span>
+              <code>v2026.7.1-update</code>
+            </span>
+            <span class="meta-box version">
+              <span class="meta-label">Hermes compatible version</span>
+              <code>v2026.7.1</code>
+            </span>
+          </div>
           <ul class="changelog-list">
             <li>Added <strong>Backup &amp; Restore</strong> (under <strong>Data</strong> in the sidebar) — download a full snapshot of this deployment (config, provider keys, channel tokens, approved users, chat history, memories, skills, cron jobs) as a zip, and restore it — including into a fresh project — to clone a deployment. A safety snapshot of the current state is taken automatically before every restore.</li>
           </ul>
@@ -1539,6 +1985,7 @@ function app() {
 
   return {
     page: 'setup',
+    menuOpen: false,
     vars: {},
     gw: {},
     status: {},
@@ -1549,11 +1996,17 @@ function app() {
     backupBusy: false,
     restoreBusy: false,
     restoreFile: null,
+    restoreDragging: false,
+    restoreResult: null,
     saving: false,
     restartOnSave: true,
     // True only when the SERVER has a persisted complete config.
     // Distinct from isSetupDone, which tracks the in-memory form.
     savedConfigComplete: false,
+    // Hermes release this image pins, reported by the server (HERMES_REF).
+    // Never hardcoded here — it must stay correct when a deployment is pinned
+    // to an older release via the Railway variable.
+    hermesVersion: '',
 
     tools,
 
@@ -1564,6 +2017,10 @@ function app() {
       'GLM / Z.AI':           { key: 'GLM_API_KEY',         modelKey: '_MODEL_GLM_API_KEY',         placeholder: ''          },
       'Kimi':                 { key: 'KIMI_API_KEY',         modelKey: '_MODEL_KIMI_API_KEY',        placeholder: ''          },
       'MiniMax':              { key: 'MINIMAX_API_KEY',      modelKey: '_MODEL_MINIMAX_API_KEY',     placeholder: ''          },
+      // MiniMax's China platform is a separate account and key from the global
+      // one (hermes provider id "minimax-cn"). Listed separately so both can be
+      // configured at the same time and switched between like any other pair.
+      'MiniMax (China)':      { key: 'MINIMAX_CN_API_KEY',   modelKey: '_MODEL_MINIMAX_CN_API_KEY', placeholder: ''          },
       'HuggingFace':          { key: 'HF_TOKEN',             modelKey: '_MODEL_HF_TOKEN',            placeholder: 'hf_...'   },
       'NVIDIA NIM':           { key: 'NVIDIA_API_KEY',       modelKey: '_MODEL_NVIDIA_API_KEY',      placeholder: 'nvapi-...' },
       'NovitaAI':             { key: 'NOVITA_API_KEY',       modelKey: '_MODEL_NOVITA_API_KEY',      placeholder: ''          },
@@ -1718,6 +2175,11 @@ function app() {
     },
 
     async init() {
+      // Swallow drops that miss the drop zone. Without this the browser
+      // navigates away to the dropped file, silently abandoning a half-filled
+      // setup form — and on the Backup page that looks like the restore blew up.
+      ['dragover','drop'].forEach(evt =>
+        window.addEventListener(evt, e => { e.preventDefault(); }, false));
       await Promise.all([this.loadConfig(), this.loadStatus(), this.loadLogs(), this.loadPairing(), this.loadSnapshots()]);
       setInterval(() => this.loadStatus(),  5000);
       setInterval(() => this.loadLogs(),    3000);
@@ -1802,7 +2264,11 @@ function app() {
     async loadStatus() {
       try {
         const r = await fetch('/setup/api/status');
-        if (r.ok) { const d = await r.json(); this.status = d; this.gw = d.gateway||{}; }
+        if (r.ok) {
+          const d = await r.json();
+          this.status = d; this.gw = d.gateway||{};
+          if (d.hermes_version) this.hermesVersion = d.hermes_version;
+        }
       } catch {}
     },
 
@@ -1855,6 +2321,10 @@ function app() {
           this.notify(e?.error || 'Backup failed', false);
           return;
         }
+        // Set by the server when the archive is missing state.db — hermes can
+        // now drop it and still exit 0, so a "successful" backup may not be a
+        // usable one. Surface it rather than hand over a silent partial.
+        const backupWarning = r.headers.get('x-backup-warning');
         const blob = await r.blob();
         const disposition = r.headers.get('content-disposition') || '';
         const match = disposition.match(/filename="?([^"]+)"?/);
@@ -1864,7 +2334,7 @@ function app() {
         a.href = url; a.download = filename;
         document.body.appendChild(a); a.click(); a.remove();
         URL.revokeObjectURL(url);
-        this.notify('Backup downloaded', true);
+        this.notify(backupWarning || 'Backup downloaded', !backupWarning);
       } catch (e) {
         this.notify('Backup failed: ' + e.message, false);
       }
@@ -1878,6 +2348,26 @@ function app() {
       } catch {}
     },
 
+    // Single entry point for both the drop and the file picker, so validation
+    // can't diverge between them.
+    setRestoreFile(file) {
+      if (!file) return;
+      if (!/\.zip$/i.test(file.name)) {
+        this.notify('That is not a .zip — pick the file produced by Download Backup', false);
+        return;
+      }
+      if (file.size === 0) {
+        this.notify('That file is empty', false);
+        return;
+      }
+      this.restoreFile = file;
+    },
+
+    clearRestoreFile() {
+      this.restoreFile = null;
+      if (this.$refs.restoreInput) this.$refs.restoreInput.value = '';
+    },
+
     async restoreBackup() {
       if (!this.restoreFile) return;
       if (!confirm('Restore from this backup? This overwrites the current config, credentials, and data on this deployment, and briefly restarts the gateway. A safety snapshot of the current state is taken first.')) return;
@@ -1889,16 +2379,34 @@ function app() {
         const d = await r.json().catch(() => ({}));
         if (r.ok) {
           this.notify(d.warning ? `Restored, but: ${d.warning}` : 'Restore complete', !d.warning);
+          this.setRestoreResult(d.warning
+            ? { ok: false, warn: true, msg: `Restored, but: ${d.warning}` }
+            : { ok: true, msg: 'Restore complete — your config and data were replaced and the gateway restarted.' });
           this.restoreFile = null;
           if (this.$refs.restoreInput) this.$refs.restoreInput.value = '';
           await Promise.all([this.loadConfig(), this.loadStatus(), this.loadSnapshots()]);
         } else {
           this.notify(d.error || 'Restore failed', false);
+          this.setRestoreResult({ ok: false, msg: d.error || 'Restore failed' });
         }
       } catch (e) {
         this.notify('Restore failed: ' + e.message, false);
+        this.setRestoreResult({ ok: false, msg: 'Restore failed: ' + e.message });
       }
       this.restoreBusy = false;
+    },
+
+    // Inline outcome shown in the Restore card. The toast alone is easy to miss:
+    // a restore can take a while, and a 3s message in the corner is gone by the
+    // time you look back — leaving no sign anything happened. Success clears
+    // itself; failures and warnings stay put until the next attempt, because a
+    // message you never read is the same as no message.
+    setRestoreResult(res) {
+      clearTimeout(this._restoreResultTimer);
+      this.restoreResult = res;
+      if (res && res.ok) {
+        this._restoreResultTimer = setTimeout(() => { this.restoreResult = null; }, 6000);
+      }
     },
 
     fmtBytes(n) {

@@ -57,4 +57,18 @@ fi
 # container), so removing the file unconditionally is safe.
 rm -f /data/.hermes/gateway.pid
 
+# Tell the dashboard its externally reachable URL.
+# hermes >= v2026.7.20 builds the MCP OAuth redirect_uri from the request's own
+# Host header. Our reverse proxy must strip that Host (hermes 400s anything but
+# loopback on a loopback bind), so hermes would otherwise hand the OAuth
+# provider `http://127.0.0.1:9119/...` — a URL only reachable inside this
+# container, leaving the browser on a dead tab after consent with nothing in the
+# logs. resolve_public_url() checks HERMES_DASHBOARD_PUBLIC_URL first, so
+# setting it is the supported fix. Railway injects RAILWAY_PUBLIC_DOMAIN; `:=`
+# keeps an operator-set value (e.g. a custom domain) winning.
+if [ -n "${RAILWAY_PUBLIC_DOMAIN:-}" ]; then
+  : "${HERMES_DASHBOARD_PUBLIC_URL:=https://${RAILWAY_PUBLIC_DOMAIN}}"
+  export HERMES_DASHBOARD_PUBLIC_URL
+fi
+
 exec python /app/server.py
