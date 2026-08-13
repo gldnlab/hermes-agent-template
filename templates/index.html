@@ -1208,7 +1208,7 @@
 
           <div class="field-gap" x-show="selectedProvider">
             <label class="field-label">LLM Model</label>
-            <input type="text" :value="vars.LLM_MODEL||''" @input="vars.LLM_MODEL=$event.target.value"
+            <input type="text" x-model="model"
                    :placeholder="selectedProvider === 'xAI Grok (SuperGrok)' || selectedProvider === 'xAI' ? 'e.g. grok-4.3'
                      : selectedProvider === 'Anthropic (Claude)' ? 'e.g. claude-sonnet-4-20250514'
                      : selectedProvider === 'AWS Bedrock' ? 'e.g. anthropic.claude-3-5-sonnet-20241022-v2:0'
@@ -1500,7 +1500,7 @@
           </div>
           <div class="stat-card">
             <div class="stat-label">Model</div>
-            <div class="stat-value" style="font-size:12px;word-break:break-all;" x-text="vars.LLM_MODEL||'—'"></div>
+            <div class="stat-value" style="font-size:12px;word-break:break-all;" x-text="model||'—'"></div>
           </div>
         </div>
 
@@ -1809,6 +1809,25 @@
           </div>
         </div>
 
+        <div class="changelog-entry minor">
+          <div class="changelog-date">August 13, 2026</div>
+          <div class="changelog-meta">
+            <span class="meta-box">
+              <span class="meta-label">Git branch</span>
+              <code>release/v2026.8.3/2</code>
+            </span>
+            <span class="meta-box version">
+              <span class="meta-label">Hermes compatible version</span>
+              <code>v2026.8.3</code>
+            </span>
+          </div>
+
+          <div class="changelog-group">Bug fixes</div>
+          <ul class="changelog-list">
+            <li><strong>Dashboard model choices now survive restarts.</strong> The Railway setup wrapper used to keep a second active model in <code>.env</code> and overwrite Hermes' <code>config.yaml</code> with it whenever the gateway started. Hermes' own model picker is now the sole source of truth, and stale legacy values are removed automatically.</li>
+          </ul>
+        </div>
+
         <div class="changelog-entry major">
           <div class="changelog-date">August 8, 2026</div>
           <div class="changelog-meta">
@@ -1987,6 +2006,8 @@ function app() {
     page: 'setup',
     menuOpen: false,
     vars: {},
+    // Active model is owned by Hermes config.yaml, not the wrapper's .env.
+    model: '',
     gw: {},
     status: {},
     logs: [],
@@ -2075,7 +2096,7 @@ function app() {
     },
 
     get isSetupDone() {
-      return this.configuredProviders.length > 0 && !!this.vars.LLM_MODEL;
+      return this.configuredProviders.length > 0 && !!this.model;
     },
 
     onProviderChange() {
@@ -2083,7 +2104,7 @@ function app() {
       if (!p) return;
       // Load the per-provider stored model so the model field pre-fills.
       const storedModel = p.modelKey ? this.vars[p.modelKey] : null;
-      if (storedModel) this.vars.LLM_MODEL = storedModel;
+      if (storedModel) this.model = storedModel;
       // Reset xAI flow state if switching away (unless already fully authorized).
       if (p.isOauth !== 'xai' && this.xai.status !== 'authorized') {
         this.xai.status = 'none';
@@ -2151,7 +2172,7 @@ function app() {
         const r = await fetch('/setup/api/oauth/xai/start', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ model: this.vars.LLM_MODEL || 'grok-4.3' }),
+          body: JSON.stringify({ model: this.model || 'grok-4.3' }),
         });
         const d = await r.json();
         if (!r.ok) { this.xai.error = d.error || 'Failed to start OAuth'; this.xai.loading = false; return; }
@@ -2192,6 +2213,7 @@ function app() {
         if (r.ok) {
           const d = await r.json();
           this.vars = d.vars || {};
+          this.model = d.model || '';
           // Refresh xAI OAuth status (drives configuredProviders computed getter).
           const xs = await fetch('/setup/api/oauth/xai/status').then(r2 => r2.json()).catch(() => ({ status: 'none' }));
           this.xai.status = xs.status;
@@ -2209,18 +2231,19 @@ function app() {
           for (const t of this.tools) {
             this.toolsEnabled[t.key] = !!(this.vars[t.key]);
           }
-          // savedConfigComplete: server has at least one provider + model.
-          this.savedConfigComplete = !!(this.vars.LLM_MODEL && this.configuredProviders.length > 0);
+          // Server computes readiness from Hermes' config.yaml assignment.
+          this.savedConfigComplete = !!d.complete;
         }
       } catch {}
     },
 
     async saveConfig() {
       this.saving = true;
-      // Sync per-provider model key so the configured list shows the right model.
+      // Keep per-provider display metadata without making .env authoritative
+      // for runtime model routing.
       const p = this.selectedProvider ? this.providerMap[this.selectedProvider] : null;
-      if (p && this.vars.LLM_MODEL) {
-        if (p.modelKey) this.vars[p.modelKey] = this.vars.LLM_MODEL;
+      if (p && this.model) {
+        if (p.modelKey) this.vars[p.modelKey] = this.model;
       }
       try {
         const r = await fetch('/setup/api/config', {
@@ -2228,6 +2251,7 @@ function app() {
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             vars: { ...this.vars },
+            _model: this.model,
             _restart: this.restartOnSave,
             // Tells the backend which provider's key/model pair this save
             // action just edited, so it can pin config.yaml's model.provider

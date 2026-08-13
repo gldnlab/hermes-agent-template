@@ -11,6 +11,18 @@ release.
 
 ---
 
+## release/v2026.8.3/2 — August 13, 2026
+**Hermes v2026.8.3 · patch**
+
+### Bug fixes
+- **Dashboard model choices now survive restarts.** The Railway setup wrapper
+  previously stored a second active model in `.env` as `LLM_MODEL` and copied
+  it over Hermes' `config.yaml` on every gateway start. A model selected in the
+  native Hermes dashboard therefore appeared to save, then reverted after a
+  redeploy and could be paired with the wrong provider. `config.yaml` is now
+  the sole source of truth. Existing `LLM_MODEL` entries are removed at boot
+  and are used only to seed a completely unconfigured legacy deployment.
+
 ## release/v2026.8.3/1 — August 8, 2026
 **Hermes v2026.8.3 · major (Hermes upgrade, from v2026.7.20)**
 

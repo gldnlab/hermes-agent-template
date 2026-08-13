@@ -201,7 +201,6 @@ else:
 # ── Env var registry ──────────────────────────────────────────────────────────
 # (key, label, category, is_secret)
 ENV_VARS = [
-    ("LLM_MODEL",               "Model",                    "model",     False),
     ("OPENROUTER_API_KEY",       "OpenRouter",               "provider",  True),
     ("DEEPSEEK_API_KEY",         "DeepSeek",                 "provider",  True),
     ("DASHSCOPE_API_KEY",        "Qwen Cloud (DashScope)",   "provider",  True),
@@ -379,7 +378,54 @@ def read_env(path: Path) -> dict[str, str]:
     return out
 
 
-def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> None:
+def read_model_assignment() -> tuple[str, str]:
+    """Return Hermes' persisted ``(provider, model)`` from config.yaml."""
+    import yaml
+
+    config_path = Path(HERMES_HOME) / "config.yaml"
+    try:
+        loaded = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+    except (yaml.YAMLError, OSError):
+        return "", ""
+    if not isinstance(loaded, dict):
+        return "", ""
+    model_cfg = loaded.get("model")
+    if isinstance(model_cfg, dict):
+        provider = str(model_cfg.get("provider") or "").strip()
+        model = str(model_cfg.get("default") or model_cfg.get("name") or "").strip()
+        return provider, model
+    if isinstance(model_cfg, str):
+        return "", model_cfg.strip()
+    return "", ""
+
+
+def migrate_legacy_model_env() -> None:
+    """Remove obsolete LLM_MODEL from .env, seeding config only if empty.
+
+    Older template releases treated .env as authoritative and rewrote
+    config.yaml on every gateway start. Preserve that value only for an
+    unconfigured deployment; an existing Hermes dashboard choice always wins.
+    """
+    data = read_env(ENV_FILE)
+    legacy_model = str(data.pop("LLM_MODEL", "") or "").strip()
+    if not legacy_model:
+        return
+    _, configured_model = read_model_assignment()
+    if not configured_model:
+        write_config_yaml(data, initial_model=legacy_model)
+    write_env(ENV_FILE, data)
+    print(
+        "[config] migrated legacy LLM_MODEL out of .env; config.yaml is authoritative",
+        flush=True,
+    )
+
+
+def write_config_yaml(
+    data: dict[str, str],
+    *,
+    reset_model: bool = False,
+    initial_model: str = "",
+) -> None:
     """Write config.yaml — deep-merge template defaults with any existing user/cron-managed sections.
 
     Previously this overwrote ``$HERMES_HOME/config.yaml`` with a hardcoded template
@@ -396,7 +442,6 @@ def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> Non
     """
     import yaml  # hermes-agent already pulls pyyaml; deferred import keeps cold start light
 
-    model = data.get("LLM_MODEL", "")
     config_path = Path(HERMES_HOME) / "config.yaml"
     config_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -413,7 +458,10 @@ def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> Non
 
     merged = dict(existing)
 
-    # Deployment-managed (always authoritative — these reflect the runtime env).
+    # Hermes owns model.default + model.provider in config.yaml. The Railway
+    # wrapper must never copy a stale model from .env over a dashboard choice
+    # during gateway start/restart. ``initial_model`` exists only for the
+    # one-time migration of legacy deployments whose config has no model yet.
     if reset_model:
         # Config reset: wipe the model block to a clean slate. Preserving the old
         # provider/base_url here would leave stale routing behind (e.g. a lingering
@@ -423,7 +471,8 @@ def write_config_yaml(data: dict[str, str], *, reset_model: bool = False) -> Non
         merged_model = {"default": ""}
     else:
         merged_model = dict(merged.get("model") if isinstance(merged.get("model"), dict) else {})
-        merged_model["default"] = model
+        if initial_model and not str(merged_model.get("default") or "").strip():
+            merged_model["default"] = initial_model
         current_provider = str(merged_model.get("provider") or "").strip()
         # Only default to "auto" on a config that has never had a provider
         # pinned. Once a provider is set explicitly — either by
@@ -589,6 +638,10 @@ def write_env(path: Path, data: dict[str, str]) -> None:
     grouped["other"] = []
 
     for k, v in data.items():
+        # Legacy only. Hermes config.yaml is the sole model source of truth;
+        # never put LLM_MODEL back into the process environment.
+        if k == "LLM_MODEL":
+            continue
         if not v:
             continue
         cat = key_cat.get(k, "other")
@@ -705,11 +758,10 @@ def _apply_xai_oauth_config(model: str) -> None:
     with config_path.open("w") as f:
         yaml.safe_dump(merged, f, sort_keys=False, default_flow_style=False)
 
-    # Persist LLM_MODEL and track the per-provider model so the setup UI can
-    # display it alongside the xAI entry in the "Configured Providers" list.
+    # Track the per-provider choice for the setup UI. The active runtime model
+    # lives only in config.yaml; it must not be duplicated into .env.
     if model:
         existing_env = read_env(ENV_FILE)
-        existing_env["LLM_MODEL"] = model
         existing_env["_MODEL_XAI_OAUTH"] = model
         write_env(ENV_FILE, existing_env)
 
@@ -861,8 +913,14 @@ def is_config_complete(data: dict[str, str] | None = None) -> bool:
     """
     if data is None:
         data = read_env(ENV_FILE)
-    has_model = bool(data.get("LLM_MODEL"))
-    has_provider = any(data.get(k) for k in PROVIDER_KEYS) or _has_xai_oauth_tokens()
+    configured_provider, configured_model = read_model_assignment()
+    has_model = bool(configured_model)
+    # An explicit config provider may be backed by Hermes OAuth state rather
+    # than one of the wrapper-managed API-key variables. ``auto`` still needs
+    # a discoverable key/token before the gateway is considered configured.
+    has_provider = bool(configured_provider and configured_provider != "auto") or any(
+        data.get(k) for k in PROVIDER_KEYS
+    ) or _has_xai_oauth_tokens()
     return has_model and has_provider
 
 
@@ -1096,7 +1154,7 @@ class Gateway:
         self._stopping = False
         try:
             env = build_hermes_env()
-            model = env.get("LLM_MODEL", "")
+            _, model = read_model_assignment()
             provider_key = next((env.get(k, "") for k in PROVIDER_KEYS if env.get(k)), "")
             print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
             # The setup UI manages only the default profile's config. Named
@@ -1496,8 +1554,14 @@ async def api_config_get(request: Request):
     if err := guard(request): return err
     async with cfg_lock:
         data = read_env(ENV_FILE)
+        _, model = read_model_assignment()
     defs = [{"key": k, "label": l, "category": c, "secret": s} for k, l, c, s in ENV_VARS]
-    return JSONResponse({"vars": mask(data), "defs": defs})
+    return JSONResponse({
+        "vars": mask(data),
+        "defs": defs,
+        "model": model,
+        "complete": is_config_complete(data),
+    })
 
 
 async def api_config_put(request: Request):
@@ -1508,14 +1572,20 @@ async def api_config_put(request: Request):
         return JSONResponse({"error": "Invalid JSON"}, status_code=400)
     try:
         restart = body.pop("_restart", False)
+        model_value = str(body.pop("_model", "") or "").strip()
         # Set by the setup wizard to the ENV_VARS key of whichever provider's
         # dropdown entry was selected in this save action (e.g. "NVIDIA_API_KEY")
         # — empty when the user saved without touching a provider (e.g. just
         # toggling a messaging channel). See set_active_model_via_hermes().
         active_provider_key = str(body.pop("_active_provider_key", "") or "").strip()
         new_vars = body.get("vars", {})
+        if not isinstance(new_vars, dict):
+            return JSONResponse({"error": "vars must be an object"}, status_code=400)
+        # Ignore stale clients that still submit the removed runtime variable.
+        new_vars.pop("LLM_MODEL", None)
         async with cfg_lock:
             existing = read_env(ENV_FILE)
+            existing.pop("LLM_MODEL", None)
             merged = unmask(new_vars, existing)
             for k, v in existing.items():
                 if k not in merged:
@@ -1525,7 +1595,6 @@ async def api_config_put(request: Request):
 
         model_warning = None
         hermes_provider_id = HERMES_PROVIDER_IDS.get(active_provider_key)
-        model_value = merged.get("LLM_MODEL", "").strip()
         if hermes_provider_id and model_value:
             pin_base_url = ""
             pin_api_key = ""
@@ -2203,6 +2272,10 @@ async def auto_start():
 @asynccontextmanager
 async def lifespan(app):
     _sweep_stale_backup_tmpdirs()
+    # One-way compatibility migration for releases that stored the active
+    # model in .env. Run before readiness checks or gateway startup so a stale
+    # value can never overwrite a newer native-dashboard choice.
+    migrate_legacy_model_env()
     # Heal a pairing store split across the legacy and consolidated dirs before
     # anything reads it. Only a restore can create that here, but an earlier
     # restore (or a volume carried over from a pre-fix deploy) may already have.
