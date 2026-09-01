@@ -169,6 +169,48 @@ def _consolidate_pairing_dirs() -> None:
         print(f"[pairing] consolidated {src.name}: {alternate} -> {active}", flush=True)
 
 
+# ── Global emergency stop / pause (hermes >= v2026.8.13) ─────────────────────
+ESTOP_FILE = Path(HERMES_HOME) / "ESTOP"
+
+
+def estop_state() -> dict | None:
+    """Pause details, or None when the bot is accepting work.
+
+    v2026.8.13 added `hermes pause` and the in-chat `/pause`, which write a
+    sentinel at ``$HERMES_HOME/ESTOP`` (agent/estop.py). While it exists hermes
+    refuses every NEW gateway turn, cron dispatch and kanban dispatch with
+    "⏸️ Hermes is paused" — but the process stays alive, so `/health` keeps
+    returning 200, `gateway_state.json` still reads "running" and the platform
+    still shows the bot online. Without this check the admin panel would show a
+    green, healthy deployment while the bot answers nothing.
+
+    Two details make it worse than an ordinary setting, and are why this is
+    surfaced rather than ignored: the sentinel lives on the Railway volume, so
+    it SURVIVES a redeploy (the reflexive "just redeploy" fix does not clear
+    it), and `/pause` is `gateway_only` with no owner gate, so any paired
+    messaging user can engage it — it is not necessarily operator-driven.
+
+    Upstream's fail-SAFE bias is copied deliberately: an unreadable sentinel
+    counts as paused. Failing open here would report "running" for exactly the
+    deployment that is refusing every message. A corrupt or empty body is still
+    a pause, with the metadata reported as None (same as upstream get_state()).
+    """
+    try:
+        if not ESTOP_FILE.exists():
+            return None
+    except OSError:
+        return {"reason": None, "engaged_at": None}
+    reason = engaged_at = None
+    try:
+        raw = json.loads(ESTOP_FILE.read_text(encoding="utf-8"))
+        if isinstance(raw, dict):
+            reason = raw.get("reason") or None
+            engaged_at = raw.get("engaged_at") or None
+    except (OSError, ValueError):
+        pass
+    return {"reason": reason, "engaged_at": engaged_at}
+
+
 PAIRING_TTL = 3600
 
 # Native Hermes dashboard — runs on loopback, fronted by our reverse proxy.
@@ -217,6 +259,13 @@ ENV_VARS = [
     # auto-routes by env-var presence, no extra config needed on our side.
     # OAuth-based providers (xAI Grok SuperGrok, Gemini CLI, Qwen OAuth, Claude Code)
     # are set up via the dashboard's Keys tab or HERMES_AUTH_JSON_BOOTSTRAP.
+    # New in hermes v2026.8.13. Plain API key (ac_…); ACTUAL_BASE_URL is
+    # deliberately NOT surfaced — it defaults to https://api.actual.inc/v1 and
+    # only needs overriding for their local offline daemon, which cannot be
+    # reached from a Railway container anyway. A new ENV_VARS *category* would
+    # also have to be added to write_env()'s cat_order or the value is silently
+    # dropped from .env, so keeping this on "provider" is the safe shape.
+    ("ACTUAL_API_KEY",           "Actual Computer",          "provider",  True),
     ("NVIDIA_API_KEY",           "NVIDIA NIM",               "provider",  True),
     ("ARCEEAI_API_KEY",          "Arcee AI",                 "provider",  True),
     ("STEPFUN_API_KEY",          "Step Plan",                "provider",  True),
@@ -286,6 +335,10 @@ ENV_LABELS = {k: l for k, l, _, _ in ENV_VARS}
 # non-obvious renames upstream (dashscope->alibaba, glm->zai, kimi->kimi-coding,
 # hf->huggingface, ollama->ollama-cloud) — re-verify every entry against
 # hermes_cli/auth.py on a Hermes version bump (same audit as the WS allowlist).
+# Re-verified against v2026.8.13's PROVIDER_REGISTRY: all ids below still exist,
+# none renamed, `actual` added. Note "openrouter" is NOT a PROVIDER_REGISTRY
+# entry in either release — resolve_provider() special-cases it (auth.py's
+# `if normalized == "openrouter": return "openrouter"`), so it stays valid.
 HERMES_PROVIDER_IDS = {
     "OPENROUTER_API_KEY":    "openrouter",
     "DEEPSEEK_API_KEY":      "deepseek",
@@ -295,6 +348,7 @@ HERMES_PROVIDER_IDS = {
     "MINIMAX_API_KEY":       "minimax",
     "MINIMAX_CN_API_KEY":    "minimax-cn",    # China platform (api.minimaxi.com)
     "HF_TOKEN":              "huggingface",
+    "ACTUAL_API_KEY":        "actual",        # Actual Computer (v2026.8.13+)
     "NVIDIA_API_KEY":        "nvidia",
     "ARCEEAI_API_KEY":       "arcee",
     "STEPFUN_API_KEY":       "stepfun",
@@ -309,26 +363,24 @@ HERMES_PROVIDER_IDS = {
     "KILOCODE_API_KEY":      "kilocode",
     "OLLAMA_API_KEY":        "ollama-cloud",
     "AZURE_FOUNDRY_API_KEY": "azure-foundry",
-    # These three are NOT in hermes' own PROVIDER_REGISTRY — verified against
-    # BOTH hermes_cli/auth.py (resolve_provider(), used by the CLI/"auto"
-    # env-var auto-detect loop) AND hermes_cli/runtime_provider.py
-    # (resolve_runtime_provider(), what the gateway/embedded Chat tab actually
-    # call at agent-init) at v2026.7.1. Neither ever discovers them: "auto"
-    # only scans PROVIDER_REGISTRY's known env vars (these aren't in it, so
-    # they're invisible to it, full stop), and pinning one of these strings
-    # as an explicit provider id raises "Unknown provider '<id>'" — both
-    # produce a dead agent ("No inference provider configured" / "Unknown
-    # provider"), confirmed live for a 9Router custom-endpoint deployment.
-    # The only way any of them work is the same mechanism hermes' OWN
-    # dashboard uses for a self-hosted/aggregator endpoint: provider="custom"
-    # plus an explicit base_url + api_key written onto model.* directly
-    # (hermes_cli/runtime_provider.py's bare-"custom" trust path reads
-    # model.base_url/model.api_key from the model block — it does NOT consult
-    # config.yaml's custom_providers[] list for this, that list is display/
-    # bookkeeping only). See CUSTOM_STYLE_BASE_URLS and
-    # set_active_model_via_hermes(). Re-verify FIREWORKS_API_KEY/NOVITA_API_KEY
-    # base URLs against those providers' own docs (not hermes') if they ever
-    # change their API surface.
+    # Fireworks and Novita are routed through provider="custom" with a fixed
+    # base_url (CUSTOM_STYLE_BASE_URLS below) rather than their native ids.
+    #
+    # CORRECTION (v2026.8.27 audit): the old comment here claimed they are absent
+    # from hermes' PROVIDER_REGISTRY. That is false and was false when written —
+    # the registry auto-extends from plugins/model-providers/, and both ids are
+    # present with the right env vars in the BUILT IMAGE at v2026.8.13 and
+    # v2026.8.27 (registry grew 47 -> 58 entries this bump). The custom routing
+    # is kept anyway: it is what existing deployments have saved in config.yaml,
+    # and switching to native ids is a migration, not a comment fix. Note
+    # "openrouter" is genuinely absent from the registry yet still valid — it is
+    # hermes' built-in default, resolved outside the plugin registry
+    # (resolve_provider("openrouter") -> "openrouter", verified in-image).
+    #
+    # CUSTOM_PROVIDER_API_KEY is different: its base_url really is user-supplied
+    # (CUSTOM_PROVIDER_BASE_URL), so it has no entry in CUSTOM_STYLE_BASE_URLS.
+    # hermes' bare-"custom" trust path reads model.base_url / model.api_key from
+    # the model block — config.yaml's custom_providers[] list is display-only.
     "CUSTOM_PROVIDER_API_KEY": "custom",   # base_url is user-supplied (CUSTOM_PROVIDER_BASE_URL) — any OpenAI-compatible endpoint, e.g. 9Router
     "FIREWORKS_API_KEY":       "custom",
     "NOVITA_API_KEY":          "custom",
@@ -545,6 +597,32 @@ def write_config_yaml(
     merged_terminal["cwd"] = "/tmp"
     merged["terminal"] = merged_terminal
 
+    # Pin the browser backend off, because this image opts into the new one by
+    # ACCIDENT. v2026.8.13 added `browser.backend`, whose default "" means "use
+    # Browser Use mode whenever the browser-use CLI is runnable" — and
+    # _find_cli() (tools/browser_use_cli.py) counts a bare `uvx` as runnable.
+    # Our base image IS ghcr.io/astral-sh/uv, which ships /usr/local/bin/uvx,
+    # so the default silently resolves to Browser Use here (verified in the
+    # built image: is_browser_use_cli_mode() -> True).
+    #
+    # That swaps the whole browser_* surface for a single `browser_exec` tool
+    # (check_fn=is_browser_use_cli_mode, and present in the general/coding/
+    # research toolsets), which shells out to `uvx browser-use` — a PyPI fetch
+    # on first call — and then needs a CDP-reachable Chrome. This image has no
+    # Chromium at all, so that tool can only fail, after burning a turn.
+    # Nothing is lost by pinning: verified on BOTH the v2026.8.3 and v2026.8.13
+    # images that check_browser_requirements() is already False here (no
+    # Chromium), so the built-in browser_* tools are not exposed either way.
+    # This keeps the model's toolbox identical to v2026.8.3 rather than handing
+    # it a tool that cannot work.
+    #
+    # setdefault, not assignment — "off" is upstream's documented opt-out, and
+    # someone who deliberately picks Browser Use in hermes' own settings (or
+    # `/browser use on`) should keep it. Revisit if Chromium is ever baked in.
+    merged_browser = dict(merged.get("browser") if isinstance(merged.get("browser"), dict) else {})
+    merged_browser.setdefault("backend", "off")
+    merged["browser"] = merged_browser
+
     merged_agent = dict(merged.get("agent") if isinstance(merged.get("agent"), dict) else {})
     merged_agent.setdefault("max_iterations", 50)
     merged["agent"] = merged_agent
@@ -583,6 +661,99 @@ def write_config_yaml(
         yaml.safe_dump(merged, f, sort_keys=False, default_flow_style=False)
 
 
+# ── Hermes dashboard auth (so MCP OAuth redirects resolve to the real host) ──
+# v2026.8.27 routes `dashboard.public_url` into should_require_dashboard_auth()
+# (hermes_cli/web_server.py): declaring a public URL turns hermes' own auth gate
+# on even for a loopback bind. That URL is ALSO the base hermes builds MCP OAuth
+# redirect_uris from (_mcp_oauth_callback_url), so suppressing it — the previous
+# fix — left every OAuth MCP server redirecting to http://127.0.0.1:9119, a dead
+# page in the user's browser.
+#
+# So we satisfy the gate instead of dodging it: hermes' bundled `basic` auth
+# provider is configured from the same admin credentials the setup page uses,
+# and HermesSession below logs in on the user's behalf so nobody ever sees a
+# second login screen. Verified live on v2026.8.27: with the gate on, the
+# redirect_uri comes back as https://<public-domain>/api/mcp/oauth/callback/<x>.
+
+
+def hermes_dashboard_credentials() -> tuple[str, str]:
+    """Credentials hermes' `basic` auth provider accepts.
+
+    Single source of truth: the same pair is handed to the dashboard subprocess
+    AND used by HermesSession to log in. Resolving them in two places would let
+    them drift, and a drift means every proxied page 401s.
+    """
+    user = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_USERNAME", "").strip()
+    pw = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_PASSWORD", "").strip()
+    return (user or ADMIN_USERNAME), (pw or ADMIN_PASSWORD)
+
+
+def hermes_dashboard_auth_secret() -> str:
+    """Token-signing key for hermes' basic-auth sessions, stable across deploys.
+
+    Generated once and kept on the volume. Without a fixed secret hermes mints a
+    random key per process, so every dashboard restart (each config save calls
+    Dashboard.restart()) would invalidate the session HermesSession holds and
+    force a needless re-login.
+    """
+    explicit = os.environ.get("HERMES_DASHBOARD_BASIC_AUTH_SECRET", "").strip()
+    if explicit:
+        return explicit
+    path = Path(HERMES_HOME) / ".dashboard_auth_secret"
+    try:
+        existing = path.read_text().strip()
+        if existing:
+            return existing
+    except OSError:
+        pass
+    secret = secrets.token_hex(32)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(secret)
+        path.chmod(0o600)
+    except OSError as e:
+        # Falls back to a per-process value: sessions then die on each dashboard
+        # restart, which HermesSession recovers from silently.
+        print(f"[server] could not persist dashboard auth secret: {e}", flush=True)
+    return secret
+
+
+def hermes_dashboard_public_url() -> str:
+    """Public origin hermes should build OAuth redirect_uris from, or ""."""
+    domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
+    return f"https://{domain}" if domain else ""
+
+
+# Env keys that kill the dashboard if a hermes subprocess ever sees them. The
+# dashboard has no respawn supervisor, so each one means every proxied page 503s
+# until the container is redeployed, while /setup and /health stay green.
+#
+#   HERMES_PARENT_PID            v2026.8.13's _start_parent_death_watchdog()
+#                                (hermes_cli/web_server.py) polls it and
+#                                os._exit(0)s once that pid is gone. It is the
+#                                Electron desktop's orphan guard and is NOT
+#                                gated on HERMES_DESKTOP, so it arms on any
+#                                `hermes dashboard` carrying the key.
+#   HERMES_DASHBOARD_PUBLIC_URL  v2026.8.27 feeds it to
+#                                should_require_dashboard_auth(); a non-loopback
+#                                value turns the auth gate on even for a
+#                                loopback bind, and with no hermes auth provider
+#                                configured the dashboard SystemExits at
+#                                startup. build_hermes_env() re-adds it AFTER
+#                                this strip, paired with the basic-auth
+#                                credentials that satisfy the gate — an inbound
+#                                value would arrive without them.
+#
+# Stripped from BOTH the subprocess env and $HERMES_HOME/.env: hermes loads that
+# file into its own os.environ at startup, so popping alone is not enough
+# (reproduced locally for HERMES_PARENT_PID against v2026.8.13).
+DASHBOARD_KILLING_KEYS = ("HERMES_PARENT_PID", "HERMES_DASHBOARD_PUBLIC_URL")
+
+# Only a restored or hand-edited .env can carry these, so .env is healed once at
+# boot and after a restore rather than checked on every read.
+ENV_FILE_FORBIDDEN_KEYS = DASHBOARD_KILLING_KEYS
+
+
 def build_hermes_env() -> dict[str, str]:
     """Merge OS env + HERMES_HOME + .env file contents for a hermes subprocess.
 
@@ -616,7 +787,45 @@ def build_hermes_env() -> dict[str, str]:
     # config.yaml, and inherited by all three restart paths (in-band, SIGUSR1,
     # and the dashboard's detached restart). setdefault: set e.g. 120 to re-arm.
     env.setdefault("HERMES_RESTART_AFTER_TURN_TIMEOUT", "0")
+    # Drop inbound values first: the template is the only thing allowed to
+    # decide these (this pop covers a Railway service variable, which lands in
+    # our own os.environ; _sanitize_env_file() covers the .env file).
+    for key in DASHBOARD_KILLING_KEYS:
+        env.pop(key, None)
+    # Configure hermes' own auth provider, then declare the public URL. The URL
+    # engages hermes' auth gate, and the gate SystemExits at startup unless a
+    # provider is registered — so it is only ever set alongside credentials that
+    # satisfy it. ADMIN_PASSWORD is always populated (generated when unset), so
+    # in practice this is always on; the guard keeps the ordering explicit.
+    user, password = hermes_dashboard_credentials()
+    if user and password:
+        env["HERMES_DASHBOARD_BASIC_AUTH_USERNAME"] = user
+        env["HERMES_DASHBOARD_BASIC_AUTH_PASSWORD"] = password
+        env["HERMES_DASHBOARD_BASIC_AUTH_SECRET"] = hermes_dashboard_auth_secret()
+        public_url = hermes_dashboard_public_url()
+        if public_url:
+            env["HERMES_DASHBOARD_PUBLIC_URL"] = public_url
     return env
+
+
+def _sanitize_env_file(path: Path = ENV_FILE) -> None:
+    """Drop inherited process keys that would kill a Hermes subprocess."""
+    try:
+        data = read_env(path)
+    except OSError:
+        return
+    removed = [k for k in ENV_FILE_FORBIDDEN_KEYS if k in data]
+    if not removed:
+        return
+    for key in removed:
+        data.pop(key, None)
+    try:
+        write_env(path, data)
+    except OSError as e:
+        print(f"[server] could not strip {removed} from {path}: {e}", flush=True)
+        return
+    print(f"[server] removed {', '.join(removed)} from {path} — it would have "
+          f"shut a Hermes subprocess down", flush=True)
 
 
 def write_env(path: Path, data: dict[str, str]) -> None:
@@ -959,7 +1168,7 @@ COOKIE_MAX_AGE = 7 * 86400  # 7 days
 COOKIE_SECRET = secrets.token_bytes(32)
 
 # Public paths — no auth required. Everything else is behind the cookie gate.
-PUBLIC_PATHS = {"/health", "/login", "/logout"}
+PUBLIC_PATHS = {"/health", "/setup/login", "/logout"}
 
 
 def _make_auth_token() -> str:
@@ -998,7 +1207,7 @@ def _safe_return_to(value: str) -> str:
 def guard(request: Request) -> Response | None:
     """Enforce auth on protected routes.
 
-    - HTML navigation: 302 to /login?returnTo=<path>
+    - HTML navigation: 302 to /setup/login?returnTo=<path>
     - API / XHR: 401 JSON (so the SPA's fetch() can surface it cleanly)
     """
     if _is_authenticated(request):
@@ -1009,7 +1218,7 @@ def guard(request: Request) -> Response | None:
         rt = request.url.path
         if request.url.query:
             rt = f"{rt}?{request.url.query}"
-        return RedirectResponse(f"/login?returnTo={_url_quote(rt)}", status_code=302)
+        return RedirectResponse(f"/setup/login?returnTo={_url_quote(rt)}", status_code=302)
     return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
 
@@ -1050,7 +1259,7 @@ button:hover{background:#7b8fff;border-color:#7b8fff}
     <div class="brand-sub">Sign in to continue</div>
   </div>
   __ERROR__
-  <form method="POST" action="/login">
+  <form method="POST" action="/setup/login">
     <input type="hidden" name="returnTo" value="__RETURN_TO__">
     <label for="username">Username</label>
     <input id="username" name="username" type="text" autocomplete="username" autofocus required>
@@ -1069,7 +1278,7 @@ def _html_escape(s: str) -> str:
 
 
 async def page_login(request: Request) -> Response:
-    """GET /login — render the sign-in form."""
+    """GET /setup/login — render the sign-in form."""
     # Already signed in? Bounce to returnTo (or /).
     if _is_authenticated(request):
         return RedirectResponse(_safe_return_to(request.query_params.get("returnTo", "/")), status_code=302)
@@ -1083,7 +1292,7 @@ async def page_login(request: Request) -> Response:
 
 
 async def login_post(request: Request) -> Response:
-    """POST /login — validate creds and set the auth cookie."""
+    """POST /setup/login — validate creds and set the auth cookie."""
     form = await request.form()
     username = str(form.get("username", ""))
     password = str(form.get("password", ""))
@@ -1102,12 +1311,20 @@ async def login_post(request: Request) -> Response:
             path="/",
         )
         return resp
-    return RedirectResponse(f"/login?returnTo={_url_quote(return_to)}&error=1", status_code=302)
+    return RedirectResponse(f"/setup/login?returnTo={_url_quote(return_to)}&error=1", status_code=302)
+
+
+async def login_redirect(request: Request) -> Response:
+    """GET /login — keep old bookmarks working after the move to /setup/login."""
+    rt = request.query_params.get("returnTo") or request.query_params.get("next") or "/"
+    return RedirectResponse(
+        f"/setup/login?returnTo={_url_quote(_safe_return_to(rt))}", status_code=302
+    )
 
 
 async def logout(request: Request) -> Response:
     """GET /logout — clear cookie and bounce to login."""
-    resp = RedirectResponse("/login", status_code=302)
+    resp = RedirectResponse("/setup/login", status_code=302)
     resp.delete_cookie(COOKIE_NAME, path="/")
     return resp
 
@@ -1125,6 +1342,11 @@ RESPAWN_WINDOW_S   = 120     # rolling window (s) for counting unexpected exits
 RESPAWN_MAX_IN_WIN = 5       # give up auto-restart after this many exits in window
 RESPAWN_BASE_DELAY = 2.0     # first backoff (seconds)
 RESPAWN_MAX_DELAY  = 30.0    # backoff cap
+
+
+# v2026.8.27's cross-profile ownership gate (gateway/run.py) logs this and
+# exits 1 rather than displacing a PID it cannot attribute to this HERMES_HOME.
+REPLACE_REFUSED_MARKER = "Refusing --replace"
 
 
 class Gateway:
@@ -1165,7 +1387,7 @@ class Gateway:
             cmd = ["hermes"]
             if self.profile:
                 cmd += ["-p", self.profile]
-            cmd += ["gateway", "run", "--replace"]
+            cmd += ["gateway", "run", "--replace", "--external-supervisor"]
             # --replace: force-displace any existing gateway.pid lock holder
             # before claiming it. Without this, a lock left behind by a prior
             # incarnation this supervisor doesn't recognize as "our" dead
@@ -1179,6 +1401,16 @@ class Gateway:
             # die. --replace is hermes' own blessed fix for exactly this
             # class of stuck-lock — it force-kills whatever holds the lock
             # (graceful SIGTERM, escalating to SIGKILL) before claiming it.
+            # --external-supervisor: tells hermes a process manager owns this
+            # gateway. v2026.8.27 narrowed its self-stop guard from the inherited
+            # _HERMES_GATEWAY marker to _is_supervised_gateway_process(), which
+            # also requires a supervisor marker — none of systemd/launchd/s6
+            # applies here, so without this flag the agent's own terminal and
+            # execute_code tools will happily run `hermes gateway stop` on
+            # themselves (they run in-process, so they satisfy the PID-file
+            # ownership half). It does not change the exit-75 restart contract:
+            # /restart already takes the via_service branch on container
+            # detection (gateway/slash_commands.py), which this only ORs with.
             self.proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 stdout=asyncio.subprocess.PIPE,
@@ -1200,14 +1432,15 @@ class Gateway:
         self.state = "stopping"
         self.proc.terminate()
         try:
-            # 20s, not 10s: tearing down several messaging adapters (Telegram +
-            # Discord + Slack polling loops, each draining in-flight sends) can
-            # outrun 10s, and SIGKILL mid-teardown skips hermes' atexit pid
-            # cleanup — which is exactly the leftover _clear_stale_pidfile()
-            # then has to mop up. Still well inside hermes' own drain+60s
-            # shutdown watchdog, and `--replace` on the next start displaces
-            # anything that did survive, so waiting longer costs only latency.
-            await asyncio.wait_for(self.proc.wait(), timeout=20)
+            # 45s, not 20s: v2026.8.27 added `agent.cron_drain_timeout` (default
+            # 30) so a SIGTERM now waits for an in-flight cron job to finish
+            # before tearing down adapters. At 20s we SIGKILLed mid-drain,
+            # defeating that and leaving the job marked running forever. 45s
+            # clears the 30s drain plus adapter teardown (Telegram + Discord +
+            # Slack polling loops) and still sits inside hermes' own 60s
+            # shutdown watchdog. SIGKILL also skips hermes' atexit pid cleanup,
+            # which is exactly the mess _clear_stale_pidfile() then mops up.
+            await asyncio.wait_for(self.proc.wait(), timeout=45)
         except asyncio.TimeoutError:
             self.proc.kill()
             await self.proc.wait()
@@ -1274,8 +1507,26 @@ class Gateway:
         # "PID file race lost". Scoped to the pid we just buried — never disturbs
         # a live gateway's lock.
         self._clear_stale_pidfile(dead_pid)
+        self._warn_if_replace_refused()
         self.restarts += 1
         await self.start(reset_budget=False)
+
+    def _warn_if_replace_refused(self) -> None:
+        """Surface v2026.8.27's `--replace` ownership gate, which no retry clears.
+
+        The gate refuses to displace a live PID it cannot attribute to this
+        HERMES_HOME and exits 1, so the respawn loop would otherwise burn its
+        whole budget printing nothing an operator can act on. A container
+        restart is the fix — start.sh sweeps the runtime records at boot.
+        """
+        recent = list(self.logs)[-30:]  # this exit's output, not the whole buffer
+        if not any(REPLACE_REFUSED_MARKER in line for line in recent):
+            return
+        self.logs.append(
+            "[gateway] hermes refused --replace: a live gateway holds the pid "
+            "record and cannot be proven to belong to this profile. Redeploy "
+            "the service to clear it (start.sh sweeps gateway.pid/lock/sock)."
+        )
 
     def _clear_stale_pidfile(self, dead_pid: int | None) -> None:
         if dead_pid is None:
@@ -1370,6 +1621,20 @@ class Dashboard:
                 env=build_hermes_env(),
             )
             print(f"[dashboard] spawned pid={self.proc.pid} → {HERMES_DASHBOARD_URL}", flush=True)
+            # One line describing the auth shape this dashboard was started
+            # with. Nearly every dashboard-side problem in this template comes
+            # down to these two facts, so a user can paste this instead of
+            # needing shell access to diagnose it.
+            public_url = hermes_dashboard_public_url()
+            user, _ = hermes_dashboard_credentials()
+            if public_url:
+                print(f"[dashboard] auth gate ON — public_url={public_url} user={user!r}; "
+                      f"this proxy signs in for you, so no second login should appear",
+                      flush=True)
+            else:
+                print("[dashboard] auth gate OFF — no RAILWAY_PUBLIC_DOMAIN, so hermes "
+                      "builds MCP OAuth redirects from the loopback address and those "
+                      "sign-ins will not complete", flush=True)
             self._drain_task = asyncio.create_task(self._drain())
         except Exception as e:
             print(f"[dashboard] FAILED to spawn: {e!r}", flush=True)
@@ -1457,7 +1722,13 @@ async def _get_hermes_session_token() -> str:
     """
     client = get_http_client()
     resp = await client.get(f"{HERMES_DASHBOARD_URL}/", timeout=httpx.Timeout(10.0))
-    resp.raise_for_status()
+    if resp.status_code != 200:
+        # Gated mode (invariant 8): `/` 302s to the login page, so there is no
+        # SPA shell and no token to scrape. Callers authenticate with the
+        # HermesSession cookies instead. Returning "" rather than raising keeps
+        # that a normal path — raise_for_status() here made every provider pin
+        # fail with "Could not fetch a Hermes session token".
+        return ""
     match = _HERMES_SESSION_TOKEN_RE.search(resp.text)
     return match.group(1) if match else ""
 
@@ -1505,10 +1776,18 @@ async def set_active_model_via_hermes(
         session_token = await _get_hermes_session_token()
     except httpx.HTTPError as e:
         return f"Could not fetch a Hermes session token to pin {provider_id} ({e}); using auto-resolution instead."
-    headers = {_SESSION_TOKEN_HEADER: session_token} if session_token else {}
 
-    try:
-        resp = await client.post(
+    async def _post(session: dict[str, str]) -> httpx.Response:
+        """One attempt, authenticated for whichever mode the dashboard is in.
+
+        The token header authenticates an ungated dashboard, the session cookies
+        a gated one. This is the only dashboard call that does not go through
+        route_proxy(), so it carries its own credentials.
+        """
+        headers = {_SESSION_TOKEN_HEADER: session_token} if session_token else {}
+        if session:
+            headers["cookie"] = "; ".join(f"{k}={v}" for k, v in session.items())
+        return await client.post(
             f"{HERMES_DASHBOARD_URL}/api/model/set",
             json={
                 "scope": "main",
@@ -1524,6 +1803,13 @@ async def set_active_model_via_hermes(
             headers=headers,
             timeout=httpx.Timeout(15.0),
         )
+
+    generation, session = hermes_session.snapshot()
+    try:
+        resp = await _post(session)
+        if resp.status_code == 401 and await hermes_session.refresh(generation):
+            _, session = hermes_session.snapshot()
+            resp = await _post(session)
     except (httpx.ConnectError, httpx.ConnectTimeout, httpx.ReadTimeout) as e:
         return f"Could not reach the Hermes dashboard to pin {provider_id} ({e}); using auto-resolution instead."
     except httpx.RequestError as e:
@@ -1607,6 +1893,17 @@ async def api_config_put(request: Request):
             model_warning = await set_active_model_via_hermes(
                 hermes_provider_id, model_value, base_url=pin_base_url, api_key=pin_api_key
             )
+            # Log the outcome either way. A failed pin is a SILENT downgrade —
+            # hermes falls back to provider auto-resolution, which works for a
+            # single-provider setup and fails opaquely for custom endpoints
+            # (their base_url/api_key are only written by this pin). The reason
+            # otherwise only exists in the HTTP response body, which nobody sees.
+            if model_warning:
+                print(f"[config] provider pin FAILED — provider={hermes_provider_id} "
+                      f"model={model_value!r}: {model_warning}", flush=True)
+            else:
+                print(f"[config] provider pin ok — provider={hermes_provider_id} "
+                      f"model={model_value!r}", flush=True)
 
         if restart:
             asyncio.create_task(gw.restart())
@@ -1639,7 +1936,36 @@ async def api_status(request: Request):
         for name, key in CHANNEL_MAP.items()
     }
     return JSONResponse({"gateway": gw.status(), "providers": providers,
-                         "channels": channels, "hermes_version": HERMES_VERSION})
+                         "channels": channels, "hermes_version": HERMES_VERSION,
+                         # None when running; a dict (possibly with null fields)
+                         # when hermes' ESTOP sentinel is engaged — see
+                         # estop_state() for why a green panel would otherwise
+                         # be actively misleading.
+                         "paused": estop_state()})
+
+
+async def api_estop_resume(request: Request):
+    """Clear the pause sentinel — the "Resume" control in the admin panel.
+
+    Mirrors hermes' own `hermes resume` / `/pause off`, which is just
+    ``disengage()`` unlinking ``$HERMES_HOME/ESTOP`` (agent/estop.py). hermes
+    re-stats the sentinel on every check with no caching, so the next inbound
+    message is served immediately — deliberately no gateway restart here, which
+    would drop adapter connections for no reason.
+
+    Resuming something that was never paused is a success, not an error: the
+    button exists to guarantee the end state, and a 404 would be a confusing
+    way to say "already running".
+    """
+    if err := guard(request): return err
+    try:
+        ESTOP_FILE.unlink()
+    except FileNotFoundError:
+        return JSONResponse({"ok": True, "resumed": False})
+    except OSError as e:
+        return JSONResponse({"error": f"Could not clear the pause: {e}"}, status_code=500)
+    print("[estop] pause cleared from the admin panel", flush=True)
+    return JSONResponse({"ok": True, "resumed": True})
 
 
 async def api_logs(request: Request):
@@ -1800,6 +2126,34 @@ BACKUP_DIR = Path(HERMES_HOME) / "backups"   # hermes' own pre-update-backup con
                                               # bloat a future full backup.
 PRE_RESTORE_KEEP = 3
 BACKUP_SUBPROCESS_TIMEOUT = 600  # 10 min ceiling for both `hermes backup` and `hermes import`
+
+# hermes >= v2026.8.13 serializes backups across processes: `run_backup` takes a
+# flock on $HERMES_HOME/.backup.lock with a 0.25s acquire timeout and, on a
+# miss, raises SystemExit(2) after printing "another Hermes backup is already
+# running". Our own asyncio `backup_lock` cannot prevent this — it only
+# serializes OUR two callers, while hermes' snapshot path is reachable
+# independently (e.g. `/snapshot` typed in the proxied Chat tab, or the native
+# dashboard's own detached backup action). Distinguishing rc 2 matters most on
+# the restore path, where a generic failure is reported as "could not create a
+# complete pre-restore safety snapshot" — which reads as "your data is
+# unbackupable" when the real cause is a quarter-second lock collision that
+# succeeds on retry.
+BACKUP_BUSY_RC = 2
+# rc 2 alone is NOT sufficient evidence of a lock collision: argparse also exits
+# 2 on an unrecognised flag (verified — `hermes backup --nonsense` -> rc 2).
+# Our argv is fixed, so that can only happen if a future hermes renames `-o`,
+# but then we would be telling the user "another backup is running" forever
+# while the real problem is a broken CLI. Require upstream's marker text too and
+# fall back to the generic failure (which prints the real output) otherwise —
+# an upstream reword degrades to today's behaviour, never to a false diagnosis.
+BACKUP_BUSY_MARKER = "already running"
+BACKUP_BUSY_MESSAGE = ("Another Hermes backup or snapshot is running right now "
+                       "(they cannot run at the same time). Try again in a moment.")
+
+
+def _is_backup_busy(rc: int, output: str) -> bool:
+    """True when `hermes backup` bailed because it lost the cross-process lock."""
+    return rc == BACKUP_BUSY_RC and BACKUP_BUSY_MARKER in (output or "").lower()
 SNAPSHOT_NAME_RE = re.compile(r"^pre-restore-\d+-[0-9a-f]+\.zip$")
 
 backup_lock = asyncio.Lock()
@@ -1859,6 +2213,82 @@ def _sweep_stale_backup_tmpdirs() -> None:
     for stale in Path(tempfile.gettempdir()).glob("hermes-backup-*"):
         shutil.rmtree(stale, ignore_errors=True)
 
+    # v2026.8.13 made `hermes backup -o` atomic: it builds the archive at
+    # `.<name>.<pid>-<tid>.partial` beside the target and os.replace()s it on a
+    # clean close. Good change — a failed backup no longer leaves a truncated
+    # zip — but a hard kill (OOM, redeploy mid-snapshot) strands the partial,
+    # and it is invisible to every cleanup we have: both
+    # _prune_pre_restore_snapshots() and api_backup_snapshots() glob
+    # `pre-restore-*.zip`, which never matches a dot-prefixed name. Left alone
+    # these accumulate on the volume forever.
+    #
+    # Age guard, not a blanket delete: our own calls are serialized by
+    # backup_lock, but hermes' dashboard has its own detached `hermes backup`
+    # action, so a fresh partial may belong to a run that is still writing.
+    # One hour is far beyond BACKUP_SUBPROCESS_TIMEOUT (10 min), so anything
+    # older cannot still be in flight.
+    cutoff = time.time() - 3600
+    try:
+        for partial in BACKUP_DIR.glob(".pre-restore-*.partial"):
+            try:
+                if partial.stat().st_mtime < cutoff:
+                    partial.unlink(missing_ok=True)
+                    print(f"[backup] removed stale partial {partial.name}", flush=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+# Mirrors hermes' own _EXCLUDED_DIRS (hermes_cli/backup.py, v2026.8.13) so
+# _live_db_names() can never demand a database hermes deliberately skips. That
+# direction matters: a false "incomplete" ABORTS a restore, which is strictly
+# worse than the gap it closes. Re-check this against upstream on a bump.
+_BACKUP_EXCLUDED_DIRS = {
+    "hermes-agent", "__pycache__", ".git", "node_modules", "backups",
+    "checkpoints", ".venv", "venv", "site-packages",
+    ".cache", ".tox", ".nox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+    # Added upstream in v2026.8.27: quick/pre-update state snapshots and the two
+    # live browser-profile dirs (Chromium holds their SQLite files locked).
+    "state-snapshots", "browser-profiles", "browser-profile",
+}
+
+
+def _live_db_names() -> set[str]:
+    """Base names of every SQLite DB on the volume that a backup should contain.
+
+    Was hardcoded to state.db. v2026.8.13 keeps adding databases beside it
+    (cron/notepad.db is new; kanban.db, cron/executions.db, projects.db,
+    response_store.db and verification_evidence.db already existed), and
+    hermes' `_safe_copy_db` fails CLOSED — it drops a database it cannot
+    snapshot from the archive while `hermes backup` still exits 0. A check
+    naming only state.db therefore certifies an archive as sound while other
+    databases are silently absent from it.
+
+    Names, not paths: hermes writes some of these nested (cron/…), and
+    _incomplete_backup_reason compares against `Path(n).name` from the zip, so
+    both sides stay prefix-agnostic. Two same-named DBs in different
+    directories would compare as one — a false NEGATIVE, which is the safe
+    direction here (it never blocks a restore).
+    """
+    root = Path(HERMES_HOME)
+    found: set[str] = set()
+    try:
+        for path in root.rglob("*.db"):
+            try:
+                if not path.is_file():
+                    continue
+                parents = path.relative_to(root).parts[:-1]
+            except (OSError, ValueError):
+                continue
+            if any(part in _BACKUP_EXCLUDED_DIRS for part in parents):
+                continue
+            found.add(path.name)
+    except OSError:
+        # Can't walk the volume — say nothing rather than block a restore.
+        return set()
+    return found
+
 
 def _incomplete_backup_reason(zip_path: Path) -> str | None:
     """Why `zip_path` is not a trustworthy backup, or None when it looks sound.
@@ -1881,9 +2311,15 @@ def _incomplete_backup_reason(zip_path: Path) -> str | None:
             names = {Path(n).name for n in zf.namelist()}
     except Exception as e:
         return f"the archive could not be read back ({e})"
-    if (Path(HERMES_HOME) / "state.db").exists() and "state.db" not in names:
-        return "state.db (sessions and chat history) is missing from the archive"
-    return None
+    missing = sorted(_live_db_names() - names)
+    if not missing:
+        return None
+    if "state.db" in missing:
+        # Name the one users recognise first — it is the sessions/chat history.
+        others = [m for m in missing if m != "state.db"]
+        tail = f" (also {', '.join(others)})" if others else ""
+        return f"state.db (sessions and chat history) is missing from the archive{tail}"
+    return f"{', '.join(missing)} missing from the archive"
 
 
 async def api_backup_download(request: Request) -> Response:
@@ -1894,6 +2330,10 @@ async def api_backup_download(request: Request) -> Response:
         tmp_dir = tempfile.mkdtemp(prefix="hermes-backup-")
         zip_path = Path(tmp_dir) / "backup.zip"
         rc, output = await _run_hermes_cli("backup", "-o", str(zip_path))
+        if _is_backup_busy(rc, output):
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return JSONResponse({"error": BACKUP_BUSY_MESSAGE, "output": output[-2000:]},
+                                status_code=409)
         if rc != 0 or not zip_path.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return JSONResponse({"error": "Backup failed", "output": output[-2000:]}, status_code=500)
@@ -2003,9 +2443,20 @@ async def api_backup_restore(request: Request) -> Response:
             # a distinct prior snapshot (two restores fired back-to-back).
             snap_path = BACKUP_DIR / f"pre-restore-{int(time.time())}-{secrets.token_hex(4)}.zip"
             rc, output = await _run_hermes_cli("backup", "-o", str(snap_path))
+            # A lock collision is transient and retryable — say so, instead of
+            # reporting it as "the backup command failed", which reads as data
+            # loss. Nothing has been touched yet at this point, so the restore
+            # is simply not started. 409, matching the in-progress guard above.
+            if _is_backup_busy(rc, output):
+                snap_path.unlink(missing_ok=True)
+                return JSONResponse(
+                    {"error": f"{BACKUP_BUSY_MESSAGE} Nothing was changed — the restore did not start.",
+                     "output": output[-2000:]},
+                    status_code=409,
+                )
             # rc alone is no longer sufficient — see _incomplete_backup_reason().
-            # A snapshot missing state.db is not an undo copy, so treat it the
-            # same as a failed one and refuse to touch live state.
+            # A snapshot missing a live database is not an undo copy, so treat
+            # it the same as a failed one and refuse to touch live state.
             snap_problem = _incomplete_backup_reason(snap_path) if rc == 0 else None
             if rc != 0 or snap_problem:
                 detail = snap_problem or "the backup command failed"
@@ -2034,6 +2485,17 @@ async def api_backup_restore(request: Request) -> Response:
                     _consolidate_pairing_dirs()
                 except Exception as e:
                     print(f"[pairing] consolidate after restore failed: {e!r}", flush=True)
+                # A restored .env is the only realistic way HERMES_PARENT_PID
+                # reaches this volume, and the dashboard is restarted just
+                # below — strip it before that spawn, not at the next boot.
+                for env_path in [ENV_FILE, *[
+                    Path(HERMES_HOME) / "profiles" / eg.profile / ".env"
+                    for eg in extra_gateways
+                ]]:
+                    try:
+                        _sanitize_env_file(env_path)
+                    except Exception as e:
+                        print(f"[server] {env_path} sanitize after restore failed: {e!r}", flush=True)
                 # Always bring the dashboard back; only auto-start the gateway if
                 # the (possibly just-restored) config is actually complete — same
                 # rule auto_start() uses on boot. This runs even if the import
@@ -2085,6 +2547,41 @@ _IN_CONTAINER_INSTALL_RE = re.compile(
     r"^/api/(?:memory/providers/[^/]+/setup|tools/toolsets/[^/]+/post-setup)$"
 )
 
+# v2026.8.13 added a SECOND way to start an install from the Tools tab, on a
+# different verb: PUT /api/tools/toolsets/<name> ("install-on-enable",
+# hermes_cli/web_routers/tools.py). Flipping a toolset ON now spawns
+# `hermes tools post-setup <key>` in the background whenever that toolset's
+# provider has a post_setup hook with an UNSATISFIED install-state predicate.
+# Today `_POST_SETUP_INSTALLED` (hermes_cli/tools_config.py) holds exactly one
+# entry — cua_driver, i.e. Computer Use — but upstream documents that dict as a
+# list to extend, so this will grow silently on future bumps.
+#
+# This is log-only, deliberately: unlike the two POST paths, we do NOT inject a
+# confirm() here. The existing notice says the install is wiped on redeploy,
+# and for cua_driver that is probably FALSE — its installer targets
+# ~/.local/bin, and the Dockerfile sets HOME=/data, so it most likely lands on
+# the Railway volume and survives (same reasoning that keeps
+# POST /api/mcp/catalog/install deliberately uncovered). Telling the user their
+# install is about to vanish when it will not is worse than staying quiet, so
+# we take the log line — which is what was actually missing — and skip the
+# popup until a path is confirmed to write into the image.
+_IN_CONTAINER_INSTALL_PUT_RE = re.compile(r"^/api/tools/toolsets/[^/]+$")
+
+
+def _in_container_install_kind(method: str, path: str) -> str | None:
+    """Name the in-container install this request starts, or None.
+
+    Method-aware because the two families differ: the memory-provider and
+    post-setup endpoints are POST, while install-on-enable is a PUT on a path
+    that has no POST equivalent (a GET of the same shape is the read side).
+    """
+    verb = method.upper()
+    if verb == "POST" and _IN_CONTAINER_INSTALL_RE.match(path):
+        return "warned"
+    if verb == "PUT" and _IN_CONTAINER_INSTALL_PUT_RE.match(path):
+        return "install-on-enable"
+    return None
+
 # Warn before any dashboard action that installs into the RUNNING container.
 # Neither endpoint carries an install-method check, so the `.install_method=docker`
 # stamp (invariant 4) does not refuse them, and on Railway the image is immutable:
@@ -2120,6 +2617,122 @@ IMMUTABLE_INSTALL_WARNING_JS = (
     '{return Promise.reject(new Error("Cancelled: immutable deployment"));}'
     '}catch(e){}return f.apply(this,arguments);};})();</script>'
 )
+
+# Cookie names hermes' dashboard-auth sessions use. Stripped from inbound
+# requests so a stale browser copy can never shadow the session we hold.
+HERMES_SESSION_COOKIE_PREFIX = "__Host-hermes_session"
+
+
+class HermesSession:
+    """The dashboard session this proxy logs in with, on the user's behalf.
+
+    Users authenticate once at our own login. Hermes' auth gate exists only so a
+    public URL can be declared (which is what makes MCP OAuth redirects resolve
+    to the real host), so nobody should ever meet a second login screen: we hold
+    a hermes session here and inject it into every proxied request.
+
+    Recovery is always possible because we hold the password — an expired or
+    invalidated session is just a re-login, not a dead end. Callers pass the
+    generation they last saw so a burst of concurrent 401s triggers ONE login
+    rather than one per request.
+    """
+
+    def __init__(self) -> None:
+        self._cookies: dict[str, str] = {}
+        self._generation = 0
+        self._lock = asyncio.Lock()
+        self._failed_note = False
+
+    def snapshot(self) -> tuple[int, dict[str, str]]:
+        """Current (generation, cookies) — cheap, lock-free read path."""
+        return self._generation, dict(self._cookies)
+
+    async def refresh(self, seen_generation: int) -> bool:
+        """Log in unless another caller already did since `seen_generation`."""
+        async with self._lock:
+            if self._generation != seen_generation:
+                return bool(self._cookies)
+            if self._cookies:
+                # Expected on a dashboard restart or after the 12h access-token
+                # TTL. Logged so a burst of these is visibly a session problem
+                # rather than an unexplained slowdown.
+                print("[dashboard-auth] dashboard rejected the held session — "
+                      "signing in again", flush=True)
+            if await self._login():
+                self._generation += 1
+                return True
+            return False
+
+    async def _login(self) -> bool:
+        user, password = hermes_dashboard_credentials()
+        try:
+            resp = await get_http_client().post(
+                f"{HERMES_DASHBOARD_URL}/auth/password-login",
+                json={"provider": "basic", "username": user, "password": password},
+            )
+        except httpx.RequestError as e:
+            print(f"[dashboard-auth] login request failed: {e!r}", flush=True)
+            return False
+        if resp.status_code != 200:
+            # Don't spam every request once credentials are genuinely wrong.
+            if not self._failed_note:
+                self._failed_note = True
+                print(
+                    f"[dashboard-auth] login rejected ({resp.status_code}). The "
+                    f"dashboard will 401 until ADMIN_PASSWORD (or the explicit "
+                    f"HERMES_DASHBOARD_BASIC_AUTH_* vars) match what the "
+                    f"dashboard subprocess was started with.",
+                    flush=True,
+                )
+            return False
+        self._cookies = {k: v for k, v in resp.cookies.items()}
+        self._failed_note = False
+        print(f"[dashboard-auth] signed in as {user!r} ({len(self._cookies)} cookies)", flush=True)
+        return bool(self._cookies)
+
+
+hermes_session = HermesSession()
+
+
+def _merge_session_cookie(header: str | None, session: dict[str, str]) -> str:
+    """Replace any inbound hermes session cookies with the ones we hold."""
+    kept = [
+        part.strip() for part in (header or "").split(";")
+        if part.strip() and not part.strip().startswith(HERMES_SESSION_COOKIE_PREFIX)
+    ]
+    kept.extend(f"{k}={v}" for k, v in session.items())
+    return "; ".join(kept)
+
+
+def _needs_dashboard_login(status: int, location: str) -> bool:
+    """True when hermes is telling us the injected session is not (or no longer) valid."""
+    if status == 401:
+        return True
+    return status in (302, 303, 307) and location.split("?", 1)[0].endswith("/login")
+
+
+# Shown only when hermes rejects our login — i.e. the credentials the dashboard
+# subprocess started with no longer match the ones we resolve. The usual cause
+# is ADMIN_PASSWORD changing without the dashboard being restarted.
+DASHBOARD_AUTH_FAILED_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Dashboard sign-in failed</title>
+<style>body{background:#0d0f14;color:#c9d1d9;font-family:ui-monospace,Menlo,monospace;
+display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0}
+.card{max-width:480px;padding:32px;border:1px solid #252d3d;border-radius:12px;
+background:#14181f;text-align:center}
+h1{font-size:16px;color:#d29922;margin:0 0 12px;font-weight:600}
+p{font-size:13px;color:#6b7688;line-height:1.6;margin:0 0 16px}
+a{color:#6272ff;text-decoration:none;border:1px solid #252d3d;border-radius:6px;
+padding:7px 14px;font-size:12px;display:inline-block}
+a:hover{border-color:#6272ff}</style></head>
+<body><div class="card">
+<h1>⚠ Could not sign in to the Hermes dashboard</h1>
+<p>The admin panel is fine — only the embedded dashboard rejected our sign-in.</p>
+<p>This usually means the admin password changed after the dashboard started.
+Restart the gateway from Status (that restarts the dashboard too), or redeploy.</p>
+<a href="/setup">← Back to Setup</a>
+</div></body></html>"""
+
 
 DASHBOARD_UNAVAILABLE_HTML = """<!DOCTYPE html>
 <html lang="en"><head><meta charset="UTF-8"><title>Dashboard starting…</title>
@@ -2160,18 +2773,42 @@ async def _proxy_to_dashboard(request: Request) -> Response:
     }
     body = await request.body()
 
+    async def send(session: dict[str, str]) -> httpx.Response:
+        headers = dict(req_headers)
+        merged = _merge_session_cookie(headers.pop("cookie", None), session)
+        if merged:
+            headers["cookie"] = merged
+        return await client.request(request.method, target, headers=headers, content=body)
+
+    generation, session = hermes_session.snapshot()
     try:
-        upstream = await client.request(
-            request.method,
-            target,
-            headers=req_headers,
-            content=body,
-        )
+        upstream = await send(session)
+        # hermes' auth gate is on (we declare a public URL so MCP OAuth
+        # redirects resolve to the real host), so a 401 — or a bounce to
+        # /login — means the session we injected is absent or expired. Re-login
+        # once and replay. The browser must never receive that redirect: /login
+        # is OUR route, so forwarding it would bounce the user straight back
+        # here, forever.
+        if _needs_dashboard_login(upstream.status_code, upstream.headers.get("location", "")):
+            if await hermes_session.refresh(generation):
+                _, session = hermes_session.snapshot()
+                upstream = await send(session)
     except (httpx.ConnectError, httpx.ConnectTimeout):
         return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=503)
     except httpx.RequestError as e:
         print(f"[proxy] upstream error for {request.method} {request.url.path}: {e}", flush=True)
         return HTMLResponse(DASHBOARD_UNAVAILABLE_HTML, status_code=502)
+
+    # Still unauthenticated after a fresh login — credentials genuinely don't
+    # match what the dashboard subprocess started with. Fail visibly rather
+    # than forwarding a redirect that would loop.
+    if _needs_dashboard_login(upstream.status_code, upstream.headers.get("location", "")):
+        user, _ = hermes_dashboard_credentials()
+        print(f"[dashboard-auth] still unauthenticated after signing in as {user!r} — "
+              f"{request.method} {request.url.path}. The dashboard subprocess was started "
+              f"with different credentials; restart the gateway from Status (that restarts "
+              f"the dashboard too) or redeploy.", flush=True)
+        return HTMLResponse(DASHBOARD_AUTH_FAILED_HTML, status_code=502)
 
     # Surface non-2xx responses from hermes into Railway logs so we can
     # diagnose 401/500s without needing browser DevTools access.
@@ -2239,9 +2876,17 @@ async def route_proxy(request: Request) -> Response:
     # the confirm() from IMMUTABLE_INSTALL_WARNING_JS, but this is the only
     # record in `railway logs` explaining why a provider works now and breaks
     # after the next redeploy.
-    if request.method == "POST" and _IN_CONTAINER_INSTALL_RE.match(request.url.path):
+    kind = _in_container_install_kind(request.method, request.url.path)
+    if kind == "warned":
         print(f"[proxy] in-container install requested: {request.url.path} — "
               f"immutable image, this will not survive a redeploy", flush=True)
+    elif kind == "install-on-enable":
+        # No confirm() fires for this one — see _IN_CONTAINER_INSTALL_PUT_RE.
+        # This line is the only trace that a toolset toggle kicked off a
+        # background `hermes tools post-setup`, so keep it even though the
+        # install itself most likely lands on the volume.
+        print(f"[proxy] toolset enable may trigger an install-on-enable: "
+              f"{request.method} {request.url.path} (hermes >= v2026.8.13)", flush=True)
     return await _proxy_to_dashboard(request)
 
 
@@ -2276,6 +2921,17 @@ async def lifespan(app):
     # model in .env. Run before readiness checks or gateway startup so a stale
     # value can never overwrite a newer native-dashboard choice.
     migrate_legacy_model_env()
+    # Strip .env keys that would make hermes shut its own dashboard down before
+    # we spawn it — same "heal the volume before anything reads it" slot as the
+    # pairing consolidation below.
+    for env_path in [ENV_FILE, *[
+        Path(HERMES_HOME) / "profiles" / eg.profile / ".env"
+        for eg in extra_gateways
+    ]]:
+        try:
+            _sanitize_env_file(env_path)
+        except Exception as e:
+            print(f"[server] {env_path} sanitize at boot failed: {e!r}", flush=True)
     # Heal a pairing store split across the legacy and consolidated dirs before
     # anything reads it. Only a restore can create that here, but an earlier
     # restore (or a volume carried over from a pre-fix deploy) may already have.
@@ -2486,11 +3142,19 @@ ANY_METHOD = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 routes = [
     # Public — no auth required.
     Route("/health",                            route_health),
-    Route("/login",                             page_login,          methods=["GET"]),
-    Route("/login",                             login_post,          methods=["POST"]),
+    # Our sign-in lives under /setup/* so the bare /login path stays free.
+    # hermes' own gated dashboard redirects unauthenticated requests there, and
+    # a route of ours at /login would answer instead — the browser would bounce
+    # between the two forever (reproduced on v2026.8.27: 8 redirects, then the
+    # browser gives up). The proxy re-logins internally so that redirect should
+    # never reach a browser, but the path stays clear regardless.
+    Route("/login",                             login_redirect,      methods=["GET"]),
     Route("/logout",                            logout),
 
     # Our setup wizard + management API, all under /setup/* (cookie-auth guarded).
+    # /setup/login must precede the /setup/{path:path} catch-all further down.
+    Route("/setup/login",                       page_login,          methods=["GET"]),
+    Route("/setup/login",                       login_post,          methods=["POST"]),
     Route("/setup",                             page_index),
     Route("/setup/",                            page_index),
     Route("/setup/api/config",                  api_config_get,      methods=["GET"]),
@@ -2501,6 +3165,7 @@ routes = [
     Route("/setup/api/gateway/stop",            api_gw_stop,         methods=["POST"]),
     Route("/setup/api/gateway/restart",         api_gw_restart,      methods=["POST"]),
     Route("/setup/api/config/reset",            api_config_reset,    methods=["POST"]),
+    Route("/setup/api/pause/resume",            api_estop_resume,    methods=["POST"]),
     Route("/setup/api/pairing/pending",         api_pairing_pending),
     Route("/setup/api/pairing/approve",         api_pairing_approve, methods=["POST"]),
     Route("/setup/api/pairing/deny",            api_pairing_deny,    methods=["POST"]),

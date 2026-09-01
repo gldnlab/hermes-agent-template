@@ -628,6 +628,7 @@
     text-align: center;
   }
   .hint { font-size: 12px; color: var(--text-dim); margin-top: 6px; }
+  .hint.warn { color: var(--yellow); }
   code { font-family: var(--font-mono); color: var(--accent); }
   .field-gap { margin-top: 12px; }
 
@@ -1004,8 +1005,10 @@
   <img src="https://pbs.twimg.com/profile_images/1816254738234761216/TX7TW-Mp_400x400.jpg"
        alt="Hermes" style="width:28px;height:28px;border-radius:6px;flex-shrink:0;">
   <div class="logo">hermes<span>/admin</span></div>
-  <div class="status-dot" :class="gw.state||'stopped'"></div>
-  <div id="status-label" x-text="gw.state||'stopped'"></div>
+  <!-- A paused bot keeps its gateway "running", so the plain state would read
+       green while every message is refused. Paused wins the header readout. -->
+  <div class="status-dot" :class="paused ? 'error' : (gw.state||'stopped')"></div>
+  <div id="status-label" x-text="paused ? 'paused' : (gw.state||'stopped')"></div>
   <div class="header-spacer"></div>
   <div class="header-branding">
     <span>made with ♥ by</span>
@@ -1175,6 +1178,10 @@
                    :value="selectedProvider ? (vars[providerMap[selectedProvider]?.key]||'') : ''"
                    @input="if(selectedProvider && providerMap[selectedProvider]?.key) vars[providerMap[selectedProvider].key]=$event.target.value"
                    :placeholder="selectedProvider ? (providerMap[selectedProvider]?.placeholder||'Paste your API key') : ''">
+            <p class="hint warn" x-show="providerKeyPrefixMismatch">
+              This key doesn't start with <code x-text="providerMap[selectedProvider]?.keyPrefix"></code>.
+              Hermes will ignore it and the bot won't reply — check you copied the whole key.
+            </p>
           </div>
 
           <!-- AWS Bedrock extra fields (after Access Key ID) -->
@@ -1482,6 +1489,28 @@
         <div class="panel-subtitle" x-text="gw.uptime!=null ? 'uptime: '+fmtUptime(gw.uptime) : ''"></div>
       </div>
       <div class="panel-body">
+
+        <!-- Paused (hermes ESTOP). The gateway keeps reporting "running" and
+             /health keeps returning 200 while every message is refused, so this
+             banner is the only place the state is visible. It survives a
+             redeploy — the sentinel lives on the volume — which is why the copy
+             says so explicitly rather than leaving "try redeploying" implied. -->
+        <div x-show="paused"
+             style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:12px 14px;margin-bottom:16px;
+                    background:rgba(248,81,73,0.09);border:1px solid rgba(248,81,73,0.35);border-radius:8px;">
+          <span style="font-size:18px;line-height:1;">⏸️</span>
+          <div style="flex:1;min-width:220px;">
+            <div style="color:var(--red);font-weight:600;font-size:13px;">Bot is paused — it is refusing every message</div>
+            <div style="color:var(--text-dim);font-size:12px;margin-top:3px;">
+              Someone ran <code>/pause</code> in chat or <code>hermes pause</code>. The gateway still shows
+              “running” and health checks still pass. This <strong>survives a redeploy</strong>, so restarting
+              the service will not clear it.
+              <span x-show="paused && paused.reason" x-text="'Reason: ' + (paused && paused.reason)"></span>
+              <span x-show="paused && paused.engaged_at" x-text="' Since: ' + (paused && paused.engaged_at)"></span>
+            </div>
+          </div>
+          <button class="btn success" @click="resumeBot()">▶ Resume</button>
+        </div>
 
         <div class="stat-grid">
           <div class="stat-card">
@@ -1829,6 +1858,76 @@
         </div>
 
         <div class="changelog-entry major">
+          <div class="changelog-date">August 29, 2026</div>
+          <div class="changelog-meta">
+            <span class="meta-box">
+              <span class="meta-label">Git branch</span>
+              <code>release/v2026.8.27/1</code>
+            </span>
+            <span class="meta-box version">
+              <span class="meta-label">Hermes compatible version</span>
+              <code>v2026.8.27</code>
+            </span>
+          </div>
+
+          <div class="changelog-group">Hermes update</div>
+          <ul class="changelog-list">
+            <li>Updated <strong>Hermes Agent to v2026.8.27</strong> (from v2026.8.13), covering five upstream releases. Eleven more AI providers are available from the Hermes Dashboard &rarr; Keys tab, and everything you had configured keeps working unchanged.</li>
+            <li><strong>Helper agents work harder by default.</strong> When the bot splits a task into helpers, Hermes raised both how many steps each helper may take (50 → 250) and how many run at once (3 → 10). Both are Hermes' own new defaults, left as-is. The step limit only changes for brand-new deployments, but <em>the parallel limit applies to everyone straight away</em> — so a busy bot can do more at once, and spend more with your provider.</li>
+          </ul>
+
+          <div class="changelog-group">Changes to support upstream updates</div>
+          <ul class="changelog-list">
+            <li><strong>The Hermes dashboard keeps working — and MCP tool sign-ins now work too.</strong> Hermes now treats a deployment that advertises a public web address as one that must have its own password, and shuts the dashboard down at startup when it doesn't. On Railway that address is filled in automatically, so Chat, Keys, Kanban and every other Hermes page would have shown &ldquo;Dashboard unavailable&rdquo; on every deploy — while this admin panel and the health check stayed perfectly green. That same address is what Hermes uses to send you back after approving an MCP tool login, so simply dropping it would have quietly broken those. Instead, the Hermes dashboard now has its own password — set automatically from your admin login — and this template signs in for you behind the scenes. <strong>You still sign in once, exactly as before.</strong></li>
+            <li><strong>The sign-in page moved to <code>/setup/login</code>.</strong> Old links still work. If you had bookmarked the login page directly, it will redirect you.</li>
+            <li><strong>Restoring a backup works again.</strong> Hermes started leaving three more folders out of backups. Our safety check didn't know that and could refuse a perfectly good archive with &ldquo;couldn't create a complete safety snapshot&rdquo;, blocking the restore entirely.</li>
+            <li><strong>The bot can no longer switch itself off.</strong> Hermes relaxed the rule that stopped the agent shutting down its own gateway, so a stray instruction could take the bot offline. This template now identifies itself as the supervisor, which restores the block.</li>
+            <li><strong>Scheduled jobs finish before a restart.</strong> Hermes now waits for a running scheduled job to complete when shutting down. We were cutting it off too early, killing the job halfway and leaving it stuck as &ldquo;running&rdquo;.</li>
+            <li><strong>Leftover lock files are cleared on boot</strong>, so a new safety check in Hermes can't leave the bot unable to restart.</li>
+          </ul>
+
+          <div class="changelog-group">Improvements</div>
+          <ul class="changelog-list">
+            <li><strong>A mistyped OpenRouter key is caught before you save.</strong> Hermes now ignores any OpenRouter key that doesn't begin with <code>sk-or-</code>, without showing an error anywhere — the bot simply never replies. Setup now warns you the moment the pasted key can't work.</li>
+          </ul>
+        </div>
+
+        <div class="changelog-entry major">
+          <div class="changelog-date">August 15, 2026</div>
+          <div class="changelog-meta">
+            <span class="meta-box">
+              <span class="meta-label">Git branch</span>
+              <code>release/v2026.8.13/1</code>
+            </span>
+            <span class="meta-box version">
+              <span class="meta-label">Hermes compatible version</span>
+              <code>v2026.8.13</code>
+            </span>
+          </div>
+
+          <div class="changelog-group">Hermes update</div>
+          <ul class="changelog-list">
+            <li>Updated <strong>Hermes Agent to v2026.8.13</strong> (from v2026.8.3) — adds a community plugin catalogue, review workflows on the Kanban board, and a new <strong>Actual Computer</strong> provider, now selectable in Setup.</li>
+            <li><strong>Fewer out-of-memory restarts.</strong> Hermes now reads the memory limit your Railway plan gives the container and drops the oldest cached conversations before it hits it, instead of being killed and restarted.</li>
+            <li><strong>Reading PDFs and Office files works.</strong> Send the bot a PDF, Word, Excel or PowerPoint file and it can now read the contents. The reader is built into the image, so it works on the first try and keeps working after every redeploy.</li>
+          </ul>
+
+          <div class="changelog-group">Changes to support upstream updates</div>
+          <ul class="changelog-list">
+            <li><strong>A paused bot is now visible.</strong> Hermes added a <code>/pause</code> command that any paired user can send. It silences the bot completely while Status still showed “running” and health checks still passed — and because it is stored on the disk, redeploying did <em>not</em> clear it. Status now shows a clear Paused banner with a <strong>Resume</strong> button.</li>
+            <li><strong>Browser tools left as they were.</strong> Hermes switched to a new browsing engine by default whenever a particular tool is present on the machine — which it is here, by coincidence of the base image. That would have handed the bot a browser tool that cannot work in this container. Pinned to the previous behaviour, so nothing changes for you.</li>
+            <li><strong>Clearer message when a backup collides.</strong> Hermes now refuses to run two backups at once. A restore that hit this reported “the backup command failed”, which reads like data loss; it now says another backup is running and nothing was changed, so you can simply retry.</li>
+            <li><strong>Backups are checked more thoroughly.</strong> The completeness check previously only looked for the conversation database; it now verifies every database on your volume is present before a backup is accepted as a safe restore point.</li>
+          </ul>
+
+          <div class="changelog-group">Bug fixes</div>
+          <ul class="changelog-list">
+            <li><strong>Restoring a backup can no longer take the dashboard down permanently.</strong> One setting, if present in a restored backup, made Hermes shut its own dashboard down seconds after start with no way back except a redeploy. It is now stripped automatically on startup and after any restore.</li>
+            <li><strong>Leftover files from interrupted backups are cleaned up</strong> instead of accumulating on your volume.</li>
+          </ul>
+        </div>
+
+        <div class="changelog-entry major">
           <div class="changelog-date">August 8, 2026</div>
           <div class="changelog-meta">
             <span class="meta-box">
@@ -2010,6 +2109,10 @@ function app() {
     model: '',
     gw: {},
     status: {},
+    // null while the bot is accepting work; {reason, engaged_at} when hermes'
+    // ESTOP sentinel is engaged. Kept as its own field (not read off `status`)
+    // so the header can show it before the Status panel is ever opened.
+    paused: null,
     logs: [],
     pending: [],
     approved: [],
@@ -2032,7 +2135,11 @@ function app() {
     tools,
 
     providerMap: {
-      'OpenRouter':           { key: 'OPENROUTER_API_KEY',  modelKey: '_MODEL_OPENROUTER_API_KEY',  placeholder: 'sk-or-...' },
+      // keyPrefix mirrors hermes' KNOWN_PROVIDER_KEY_PREFIXES (hermes_cli/auth.py,
+      // new in v2026.8.27). Hermes SKIPS a key that fails the prefix and only logs
+      // a warning, so without this the bot just never answers. Re-check on a bump —
+      // OpenRouter is the only provider upstream declares a prefix for today.
+      'OpenRouter':           { key: 'OPENROUTER_API_KEY',  modelKey: '_MODEL_OPENROUTER_API_KEY',  placeholder: 'sk-or-...', keyPrefix: 'sk-or-' },
       'DeepSeek':             { key: 'DEEPSEEK_API_KEY',    modelKey: '_MODEL_DEEPSEEK_API_KEY',    placeholder: 'sk-...'    },
       'Qwen Cloud':           { key: 'DASHSCOPE_API_KEY',   modelKey: '_MODEL_DASHSCOPE_API_KEY',   placeholder: ''          },
       'GLM / Z.AI':           { key: 'GLM_API_KEY',         modelKey: '_MODEL_GLM_API_KEY',         placeholder: ''          },
@@ -2097,6 +2204,15 @@ function app() {
 
     get isSetupDone() {
       return this.configuredProviders.length > 0 && !!this.model;
+    },
+
+    // True once a typed key provably can't work: hermes drops a key failing the
+    // provider's declared prefix and only logs it, so warn here instead.
+    get providerKeyPrefixMismatch() {
+      const p = this.providerMap[this.selectedProvider];
+      if (!p?.keyPrefix || !p.key) return false;
+      const value = (this.vars[p.key] || '').trim();
+      return value.length > 0 && !value.startsWith(p.keyPrefix);
     },
 
     onProviderChange() {
@@ -2291,6 +2407,7 @@ function app() {
         if (r.ok) {
           const d = await r.json();
           this.status = d; this.gw = d.gateway||{};
+          this.paused = d.paused || null;
           if (d.hermes_version) this.hermesVersion = d.hermes_version;
         }
       } catch {}
@@ -2320,6 +2437,19 @@ function app() {
     async startGw()        { await fetch('/setup/api/gateway/start',   {method:'POST'}); this.notify('Starting…',   true); setTimeout(()=>this.loadStatus(),1000); },
     async stopGw()         { await fetch('/setup/api/gateway/stop',    {method:'POST'}); this.notify('Stopping…',   true); setTimeout(()=>this.loadStatus(),1000); },
     async restartGateway() { await fetch('/setup/api/gateway/restart', {method:'POST'}); this.notify('Restarting…', true); setTimeout(()=>this.loadStatus(),2000); },
+
+    // Clears hermes' ESTOP sentinel. No gateway restart: hermes re-stats the
+    // file on every check, so the next message is served immediately and the
+    // adapters stay connected.
+    async resumeBot() {
+      try {
+        const r = await fetch('/setup/api/pause/resume', {method:'POST'});
+        const d = await r.json().catch(()=>({}));
+        if (r.ok) { this.paused = null; this.notify(d.resumed ? 'Resumed — the bot is accepting messages again' : 'Already running', true); }
+        else      { this.notify(d.error || 'Could not resume', false); }
+      } catch { this.notify('Could not resume', false); }
+      this.loadStatus();
+    },
 
     async approve(platform, code) {
       const r = await fetch('/setup/api/pairing/approve', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({platform,code}) });
