@@ -29,6 +29,8 @@ workspace_backend:
 codex:
   binary: /usr/bin/codex
   home: /srv/atlas/home/.codex
+  model: gpt-6-astra
+  reasoning_effort: medium
   sandbox: workspace-write
   timeout: 3600
 

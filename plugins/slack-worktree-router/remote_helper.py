@@ -171,7 +171,9 @@ def _run_codex(router: Router, mapping: Mapping, prompt: str) -> dict[str, Any]:
         prior_thread_id = _codex_session(router, mapping)
         common = [
             "--json",
+            "--model", config.codex_model,
             "-c", 'approval_policy="never"',
+            "-c", f'model_reasoning_effort="{config.codex_reasoning_effort}"',
             "-c", f'sandbox_mode="{config.codex_sandbox}"',
             "-c", "sandbox_workspace_write.network_access=true",
         ]
@@ -194,6 +196,8 @@ def _run_codex(router: Router, mapping: Mapping, prompt: str) -> dict[str, Any]:
             session_id=mapping.session_id,
             github_repo=mapping.github_repo,
             worktree=str(mapping.worktree),
+            model=config.codex_model,
+            reasoning_effort=config.codex_reasoning_effort,
             resumed=bool(prior_thread_id),
         )
         try:
@@ -243,8 +247,10 @@ def _codex_preflight(router: Router) -> dict[str, Any]:
     env["CODEX_HOME"] = str(config.codex_home)
     argv = [
         config.codex_binary, "exec", "--ephemeral", "--json", "--color", "never",
+        "--model", config.codex_model,
         "--sandbox", "read-only", "-C", str(route.repo),
-        "-c", 'approval_policy="never"', "-",
+        "-c", 'approval_policy="never"',
+        "-c", f'model_reasoning_effort="{config.codex_reasoning_effort}"', "-",
     ]
     try:
         result = subprocess.run(
@@ -266,7 +272,11 @@ def _codex_preflight(router: Router) -> dict[str, Any]:
     _thread_id, final = _parse_codex_jsonl(result.stdout)
     if final.strip() != "ATLAS_CODEX_OK":
         raise RouterError("Codex authentication preflight returned an unexpected response")
-    return {"authenticated": True}
+    return {
+        "authenticated": True,
+        "model": config.codex_model,
+        "reasoning_effort": config.codex_reasoning_effort,
+    }
 
 
 def _dispatch(router: Router, request: dict[str, Any]) -> dict[str, Any]:
@@ -282,6 +292,8 @@ def _dispatch(router: Router, request: dict[str, Any]) -> dict[str, Any]:
             "config_fingerprint": config_fingerprint(config),
             "codex_binary_present": Path(config.codex_binary).is_file(),
             "codex_home_present": config.codex_home.is_dir(),
+            "codex_model": config.codex_model,
+            "codex_reasoning_effort": config.codex_reasoning_effort,
         }
 
     if operation == "codex_preflight":

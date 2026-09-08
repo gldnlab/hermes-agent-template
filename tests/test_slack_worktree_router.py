@@ -70,6 +70,8 @@ def configured_router(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, router_mo
         "codex": {
             "binary": sys.executable,
             "home": str(tmp_path / "codex-home"),
+            "model": "gpt-6-astra",
+            "reasoning_effort": "medium",
             "sandbox": "workspace-write",
             "timeout": 300,
         },
@@ -624,6 +626,9 @@ def test_codex_runner_persists_and_resumes_thread(
     assert "resume" not in commands[0]
     assert "resume" in commands[1]
     assert "codex-thread-1" in commands[1]
+    for command in commands:
+        assert command[command.index("--model") + 1] == "gpt-6-astra"
+        assert 'model_reasoning_effort="medium"' in command
 
 
 def test_pre_push_guard_allows_only_atlas_branches():

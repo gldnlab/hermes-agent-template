@@ -42,9 +42,27 @@ def main() -> int:
                   "Codex binary exists on DigitalOcean")
             check("codex_home", bool(response.get("codex_home_present")),
                   "configured Codex home exists on DigitalOcean")
+            check(
+                "codex_model",
+                response.get("codex_model") == config.codex_model,
+                f"helper pins {response.get('codex_model')}",
+            )
+            check(
+                "codex_reasoning_effort",
+                response.get("codex_reasoning_effort") == config.codex_reasoning_effort,
+                f"helper pins {response.get('codex_reasoning_effort')} reasoning",
+            )
             preflight = router._remote_request(config, "codex_preflight")
-            check("codex_auth", preflight.get("authenticated") is True,
-                  "fresh read-only Codex turn succeeded")
+            preflight_matches = (
+                preflight.get("authenticated") is True
+                and preflight.get("model") == config.codex_model
+                and preflight.get("reasoning_effort") == config.codex_reasoning_effort
+            )
+            check(
+                "codex_auth",
+                preflight_matches,
+                f"fresh read-only {config.codex_model}/{config.codex_reasoning_effort} turn succeeded",
+            )
     except Exception as exc:
         check("diagnostic_exception", False, f"{type(exc).__name__}: {exc}")
 

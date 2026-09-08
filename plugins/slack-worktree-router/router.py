@@ -128,6 +128,8 @@ class Config:
     helper_timeout: int
     codex_binary: str
     codex_home: Path
+    codex_model: str
+    codex_reasoning_effort: str
     codex_sandbox: str
     codex_timeout: int
     routes: dict[str, Route]
@@ -161,6 +163,8 @@ def config_fingerprint(config: Config) -> str:
         "codex": {
             "binary": config.codex_binary,
             "home": str(config.codex_home),
+            "model": config.codex_model,
+            "reasoning_effort": config.codex_reasoning_effort,
             "sandbox": config.codex_sandbox,
             "timeout": config.codex_timeout,
         },
@@ -322,6 +326,16 @@ def _load_config() -> Config:
     codex_home = Path(
         _required_text(codex_raw.get("home"), "codex.home")
     ).expanduser().resolve()
+    codex_model = _required_text(codex_raw.get("model"), "codex.model")
+    if not _SAFE_ID.fullmatch(codex_model):
+        raise RouterError("codex.model contains unsafe characters")
+    codex_reasoning_effort = _required_text(
+        codex_raw.get("reasoning_effort"), "codex.reasoning_effort"
+    ).lower()
+    if codex_reasoning_effort not in {"minimal", "low", "medium", "high", "xhigh"}:
+        raise RouterError(
+            "codex.reasoning_effort must be minimal, low, medium, high, or xhigh"
+        )
     codex_sandbox = str(codex_raw.get("sandbox", "workspace-write")).strip()
     if codex_sandbox not in {"read-only", "workspace-write"}:
         raise RouterError("codex.sandbox must be read-only or workspace-write")
@@ -363,6 +377,8 @@ def _load_config() -> Config:
         helper_timeout=helper_timeout,
         codex_binary=codex_binary,
         codex_home=codex_home,
+        codex_model=codex_model,
+        codex_reasoning_effort=codex_reasoning_effort,
         codex_sandbox=codex_sandbox,
         codex_timeout=codex_timeout,
         routes=routes,

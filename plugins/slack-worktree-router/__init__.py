@@ -112,6 +112,7 @@ async def _run_atlas_turn(
                   workspace_id=mapping.workspace_id, channel_id=mapping.channel_id,
                   thread_ts=mapping.thread_ts, github_repo=mapping.github_repo,
                   branch=mapping.branch, base_sha=mapping.base_sha)
+        config = ROUTER.config()
         await _deliver_slack(
             gateway, channel_id=channel_id, thread_ts=thread_ts, workspace_id=workspace_id,
             event_name="atlas_started",
@@ -120,6 +121,7 @@ async def _run_atlas_turn(
                 f"Repository: `{mapping.github_repo}`\n"
                 f"Branch: `{mapping.branch}`\n"
                 f"Base: `{mapping.base_branch}` @ `{mapping.base_sha[:12]}`\n"
+                f"Model: `{config.codex_model}` · reasoning: `{config.codex_reasoning_effort}`\n"
                 "GitHub is the source of truth."
             ),
         )

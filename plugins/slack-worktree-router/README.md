@@ -31,7 +31,8 @@ background job and tells Hermes to skip normal dispatch. The helper then:
 1. fetches the mapped repository from GitHub;
 2. records the exact base SHA;
 3. creates one `atlas/slack-*` branch and worktree;
-4. starts `codex exec --json` in that worktree;
+4. starts `codex exec --json` with the configured model and reasoning effort in
+   that worktree;
 5. saves the emitted Codex thread ID in SQLite; and
 6. returns Codex's final response through Atlas's existing Slack adapter.
 
@@ -41,6 +42,8 @@ resume` session. No Buzz process or Buzz relay participates.
 Codex runs with `approval_policy="never"` and the `workspace-write` sandbox. It
 has network access so it can push its mapped branch and open a PR. Main-branch
 protection and restricted GitHub credentials remain independent safeguards.
+The deployed Atlas route pins `gpt-6-astra` with `medium` reasoning; the first
+Slack status message and structured helper logs report both values.
 
 ## Failure behavior
 
