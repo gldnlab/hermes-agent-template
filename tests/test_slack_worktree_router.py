@@ -243,6 +243,48 @@ def test_plugin_registers_expected_hermes_surfaces():
     assert options == {"position": "after_memory", "max_chars": 2400}
 
 
+def test_tool_boundary_ignores_normal_slack_dm_sessions():
+    spec = importlib.util.spec_from_file_location(
+        "slack_worktree_router_scope",
+        PLUGIN_DIR / "__init__.py",
+        submodule_search_locations=[str(PLUGIN_DIR)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class FakeRouter:
+        def tool_directive(self, *_args, **_kwargs):
+            raise AssertionError("normal DMs must not enter the coding boundary")
+
+    module.ROUTER = FakeRouter()
+    assert module._pre_tool_call("terminal", {"command": "pwd"}, "dm-session") is None
+
+
+def test_tool_boundary_stays_fail_closed_for_routed_sessions():
+    spec = importlib.util.spec_from_file_location(
+        "slack_worktree_router_scope_routed",
+        PLUGIN_DIR / "__init__.py",
+        submodule_search_locations=[str(PLUGIN_DIR)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+
+    class FakeRouter:
+        def tool_directive(self, tool_name, args, session_id):
+            assert (tool_name, session_id) == ("terminal", "routed-session")
+            return {"action": "block", "message": "isolated"}
+
+    module.ROUTER = FakeRouter()
+    module._ROUTED_SESSIONS.add("routed-session")
+    assert module._pre_tool_call(
+        "terminal", {"command": "pwd"}, "routed-session"
+    ) == {"action": "block", "message": "isolated"}
+
+
 def test_remote_helper_protocol_is_json_and_idempotent(configured_router, router_module):
     _, _repo = configured_router
     config_path = os.environ[router_module.ROUTES_ENV]

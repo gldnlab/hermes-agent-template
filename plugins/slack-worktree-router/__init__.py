@@ -13,6 +13,7 @@ from .router import Router, RouterError, authorized_route, log_event, normalize_
 
 ROUTER = Router()
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
+_ROUTED_SESSIONS: set[str] = set()
 
 
 def _slack_adapter(gateway: Any) -> Any | None:
@@ -165,6 +166,11 @@ def _pre_gateway_dispatch(
         if session_store is None:
             raise RouterError("Hermes session store is unavailable")
         entry = session_store.get_or_create_session(source, touch_activity=False)
+        session_id = str(entry.session_id)
+        # Scope the fail-closed tool boundary to sessions that entered through
+        # an explicitly configured repo channel route. Ordinary Slack DMs and
+        # unrelated channels must retain Hermes's normal tools.
+        _ROUTED_SESSIONS.add(session_id)
         thread_ts = str(getattr(source, "thread_id", None) or getattr(event, "message_id", None) or "")
         if not thread_ts:
             raise RouterError("Slack event has no stable thread timestamp")
@@ -173,7 +179,7 @@ def _pre_gateway_dispatch(
         if channel_context:
             prompt = f"Slack thread context before this request:\n{channel_context}\n\nCurrent request:\n{prompt}"
         task = asyncio.get_running_loop().create_task(_run_atlas_turn(
-            gateway=gateway, session_id=str(entry.session_id), workspace_id=workspace_id,
+            gateway=gateway, session_id=session_id, workspace_id=workspace_id,
             channel_id=channel_id, thread_ts=thread_ts, user_id=user_id,
             prompt=prompt,
         ))
@@ -192,12 +198,14 @@ def _pre_gateway_dispatch(
 
 
 def _pre_tool_call(tool_name: str = "", args: Any = None, session_id: str = "", **_: Any):
+    if not session_id or session_id not in _ROUTED_SESSIONS:
+        return None
     return ROUTER.tool_directive(tool_name, args, session_id)
 
 
 def _system_prompt(session_info: Any) -> str:
     session_id = str(session_info.get("session_id", "") if session_info else "")
-    if not session_id:
+    if not session_id or session_id not in _ROUTED_SESSIONS:
         return ""
     try:
         mapping = ROUTER.lookup(session_id)
