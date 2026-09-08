@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Atlas Slack worktree cleanup daily
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15m
+
+[Install]
+WantedBy=timers.target

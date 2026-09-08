@@ -97,6 +97,16 @@ ephemeral, read-only Codex turn. This catches expired refresh tokens that
 
 ## Lifecycle
 
-Worktrees are retained. A separate cleanup job should remove one only after its
-PR is merged or closed and `git status --porcelain` is empty. A Slack turn never
-deletes uncommitted work.
+The DigitalOcean systemd timer runs cleanup daily. It removes a clean,
+unchanged workspace after 24 hours of inactivity and removes clean workspaces
+whose PR is merged. A closed-but-unmerged PR is removed only while its exact
+branch head remains on GitHub. Workspaces with uncommitted changes, unpushed
+commits, pushed work without a concluded PR, or an active Codex turn are
+retained and logged.
+
+Cleanup writes an archive tombstone before removing a worktree and local
+branch. Replies to an archived Slack thread fail with an instruction to start a
+new top-level thread instead of silently recreating conflicting state. An
+untouched workspace can also be removed immediately by replying exactly
+`@Atlas abandon this thread`; Atlas refuses the command if the workspace has
+changes, commits, or a GitHub branch.

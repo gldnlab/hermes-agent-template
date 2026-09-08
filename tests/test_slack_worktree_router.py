@@ -287,6 +287,21 @@ def test_tool_boundary_stays_fail_closed_for_routed_sessions():
     ) == {"action": "block", "message": "isolated"}
 
 
+def test_abandon_command_is_explicit():
+    spec = importlib.util.spec_from_file_location(
+        "slack_worktree_router_abandon_command",
+        PLUGIN_DIR / "__init__.py",
+        submodule_search_locations=[str(PLUGIN_DIR)],
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    assert module._is_abandon_command("<@UATLAS> abandon this thread") is True
+    assert module._is_abandon_command("abandon!") is True
+    assert module._is_abandon_command("can you abandon this thread?") is False
+
+
 def test_remote_helper_protocol_is_json_and_idempotent(configured_router, router_module):
     _, _repo = configured_router
     config_path = os.environ[router_module.ROUTES_ENV]
@@ -657,3 +672,90 @@ def test_pre_push_guard_allows_only_atlas_branches():
     assert allowed.returncode == 0
     assert blocked.returncode != 0
     assert "only atlas/* branches" in blocked.stderr
+
+
+def test_cleanup_expires_only_untouched_inactive_workspace(
+    configured_router, router_module, monkeypatch
+):
+    router, _ = configured_router
+    mapping = provision(router)
+    sys.modules["router"] = router_module
+    spec = importlib.util.spec_from_file_location(
+        "slack_worktree_router_cleanup",
+        PLUGIN_DIR / "remote_helper.py",
+    )
+    helper = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = helper
+    assert spec.loader is not None
+    spec.loader.exec_module(helper)
+    monkeypatch.setattr(helper, "_remote_branch_sha", lambda _mapping: None)
+
+    with router._connect(router.config()) as conn:
+        conn.execute(
+            "UPDATE thread_mappings SET updated_at=datetime('now', '-25 hours') "
+            "WHERE session_id=?",
+            (mapping.session_id,),
+        )
+
+    summary = helper.cleanup_stale(router, ttl_hours=24)
+    assert [item["reason"] for item in summary["cleaned"]] == ["expired_untouched"]
+    assert summary["errors"] == []
+    assert not mapping.worktree.exists()
+    assert router.lookup(mapping.session_id) is None
+    with pytest.raises(router_module.RouterError, match="workspace was archived"):
+        provision(router)
+
+
+def test_cleanup_retains_uncommitted_workspace(
+    configured_router, router_module, monkeypatch
+):
+    router, _ = configured_router
+    mapping = provision(router)
+    (mapping.worktree / "notes.txt").write_text("keep me\n", encoding="utf-8")
+    sys.modules["router"] = router_module
+    spec = importlib.util.spec_from_file_location(
+        "slack_worktree_router_cleanup_dirty",
+        PLUGIN_DIR / "remote_helper.py",
+    )
+    helper = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = helper
+    assert spec.loader is not None
+    spec.loader.exec_module(helper)
+    monkeypatch.setattr(helper, "_remote_branch_sha", lambda _mapping: None)
+
+    with router._connect(router.config()) as conn:
+        conn.execute(
+            "UPDATE thread_mappings SET updated_at=datetime('now', '-25 hours') "
+            "WHERE session_id=?",
+            (mapping.session_id,),
+        )
+
+    summary = helper.cleanup_stale(router, ttl_hours=24)
+    assert summary["cleaned"] == []
+    assert summary["retained"] == [
+        {"session_id": mapping.session_id, "reason": "uncommitted_changes"}
+    ]
+    assert mapping.worktree.exists()
+
+
+def test_explicit_abandon_removes_only_untouched_workspace(
+    configured_router, router_module, monkeypatch
+):
+    router, _ = configured_router
+    mapping = provision(router)
+    sys.modules["router"] = router_module
+    spec = importlib.util.spec_from_file_location(
+        "slack_worktree_router_abandon",
+        PLUGIN_DIR / "remote_helper.py",
+    )
+    helper = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = helper
+    assert spec.loader is not None
+    spec.loader.exec_module(helper)
+    monkeypatch.setattr(helper, "_remote_branch_sha", lambda _mapping: None)
+
+    result = helper.abandon_workspace(router, mapping.session_id)
+    assert result["reason"] == "abandoned_untouched"
+    assert not mapping.worktree.exists()
+    with pytest.raises(router_module.RouterError, match="workspace was archived"):
+        provision(router)

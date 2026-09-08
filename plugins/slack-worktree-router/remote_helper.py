@@ -30,12 +30,14 @@ from router import (
     RouterError,
     config_fingerprint,
     safe_detail,
+    _run_git,
 )
 
 
 MAX_REQUEST_BYTES = 64 * 1024
 DEFAULT_LOG_PATH = "/var/log/hermes-worktree-helper.jsonl"
 MAX_CODEX_OUTPUT_BYTES = 8 * 1024 * 1024
+DEFAULT_CLEANUP_TTL_HOURS = 24
 
 
 def _log(event: str, **fields: Any) -> None:
@@ -101,6 +103,15 @@ def _codex_session(router: Router, mapping: Mapping) -> str | None:
     return str(row["codex_thread_id"]) if row else None
 
 
+def _touch_mapping(router: Router, mapping: Mapping) -> None:
+    config = router.config()
+    with router._connect(config) as conn:
+        conn.execute(
+            "UPDATE thread_mappings SET updated_at=CURRENT_TIMESTAMP WHERE session_id=?",
+            (mapping.session_id,),
+        )
+
+
 def _save_codex_session(router: Router, mapping: Mapping, thread_id: str) -> None:
     config = router.config()
     with router._connect(config) as conn:
@@ -115,6 +126,231 @@ def _save_codex_session(router: Router, mapping: Mapping, thread_id: str) -> Non
             """,
             (mapping.workspace_id, mapping.channel_id, mapping.thread_ts, thread_id),
         )
+        conn.execute(
+            "UPDATE thread_mappings SET updated_at=CURRENT_TIMESTAMP WHERE session_id=?",
+            (mapping.session_id,),
+        )
+
+
+def _codex_lock_path(router: Router, mapping: Mapping) -> Path:
+    config = router.config()
+    lock_dir = config.state_db.parent / "locks"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    lock_key = f"{mapping.workspace_id}:{mapping.channel_id}:{mapping.thread_ts}".encode()
+    lock_name = f"codex-{hashlib.sha256(lock_key).hexdigest()[:16]}.lock"
+    return lock_dir / lock_name
+
+
+def _remote_branch_sha(mapping: Mapping) -> str | None:
+    output = _run_git(
+        "ls-remote", "--heads", "origin", f"refs/heads/{mapping.branch}",
+        cwd=mapping.repo,
+    )
+    return output.split()[0] if output else None
+
+
+def _pull_request(mapping: Mapping) -> dict[str, Any] | None:
+    result = subprocess.run(
+        [
+            "gh", "pr", "list", "--repo", mapping.github_repo,
+            "--head", mapping.branch, "--state", "all", "--limit", "1",
+            "--json", "number,state,mergedAt,closedAt,url,headRefOid",
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+    )
+    if result.returncode:
+        detail = safe_detail(result.stderr.strip() or result.stdout.strip(), 800)
+        raise RouterError(f"GitHub PR lookup failed for {mapping.branch}: {detail}")
+    try:
+        payload = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise RouterError(f"GitHub PR lookup returned invalid JSON for {mapping.branch}") from exc
+    if not isinstance(payload, list):
+        raise RouterError(f"GitHub PR lookup returned an invalid result for {mapping.branch}")
+    return payload[0] if payload and isinstance(payload[0], dict) else None
+
+
+def _archive_and_remove(
+    router: Router,
+    mapping: Mapping,
+    *,
+    reason: str,
+    dry_run: bool,
+) -> dict[str, Any]:
+    config = router.config()
+    result = {
+        "session_id": mapping.session_id,
+        "github_repo": mapping.github_repo,
+        "branch": mapping.branch,
+        "worktree": str(mapping.worktree),
+        "reason": reason,
+        "dry_run": dry_run,
+    }
+    if dry_run:
+        return result
+
+    # Write a tombstone before filesystem mutation. If the process dies during
+    # cleanup, the old Slack thread fails closed instead of recreating a branch
+    # over partially removed state.
+    with router._connect(config) as conn:
+        conn.execute(
+            """
+            INSERT INTO archived_threads (
+                workspace_id, channel_id, thread_ts, session_id,
+                github_repo, branch, reason
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(workspace_id, channel_id, thread_ts) DO UPDATE SET
+                session_id=excluded.session_id,
+                github_repo=excluded.github_repo,
+                branch=excluded.branch,
+                reason=excluded.reason,
+                archived_at=CURRENT_TIMESTAMP
+            """,
+            (
+                mapping.workspace_id, mapping.channel_id, mapping.thread_ts,
+                mapping.session_id, mapping.github_repo, mapping.branch, reason,
+            ),
+        )
+
+    _run_git("worktree", "remove", str(mapping.worktree), cwd=mapping.repo)
+    _run_git("branch", "-D", mapping.branch, cwd=mapping.repo)
+    with router._connect(config) as conn:
+        # Older databases may not have a Codex session for a provisioned thread.
+        exists = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='codex_sessions'"
+        ).fetchone()
+        if exists:
+            conn.execute(
+                "DELETE FROM codex_sessions WHERE workspace_id=? AND channel_id=? AND thread_ts=?",
+                (mapping.workspace_id, mapping.channel_id, mapping.thread_ts),
+            )
+        conn.execute("DELETE FROM thread_mappings WHERE session_id=?", (mapping.session_id,))
+    _log("workspace_archived", **result)
+    return result
+
+
+def _evaluate_cleanup(
+    router: Router,
+    mapping: Mapping,
+    *,
+    idle_hours: float,
+    ttl_hours: int,
+    explicit_abandon: bool,
+    dry_run: bool,
+) -> tuple[str, dict[str, Any]]:
+    config = router.config()
+    lock_path = _codex_lock_path(router, mapping)
+    with lock_path.open("a+") as lock_file:
+        try:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "retained", {"session_id": mapping.session_id, "reason": "codex_active"}
+
+        router.verify(mapping, config)
+        status = _run_git("status", "--porcelain", cwd=mapping.worktree)
+        if status:
+            if explicit_abandon:
+                raise RouterError("workspace has uncommitted changes; refusing to abandon it")
+            return "retained", {"session_id": mapping.session_id, "reason": "uncommitted_changes"}
+
+        head = _run_git("rev-parse", "HEAD", cwd=mapping.worktree)
+        remote_sha = _remote_branch_sha(mapping)
+
+        if explicit_abandon:
+            if head != mapping.base_sha:
+                raise RouterError("workspace has commits; refusing to abandon it")
+            if remote_sha:
+                raise RouterError("workspace branch exists on GitHub; refusing to abandon it")
+            return "cleaned", _archive_and_remove(
+                router, mapping, reason="abandoned_untouched", dry_run=dry_run,
+            )
+
+        if idle_hours >= ttl_hours and head == mapping.base_sha and remote_sha is None:
+            return "cleaned", _archive_and_remove(
+                router, mapping, reason="expired_untouched", dry_run=dry_run,
+            )
+
+        pr = _pull_request(mapping) if head != mapping.base_sha or remote_sha else None
+        if pr and pr.get("mergedAt"):
+            return "cleaned", _archive_and_remove(
+                router, mapping, reason=f"pr_{pr.get('number')}_merged", dry_run=dry_run,
+            )
+        if pr and str(pr.get("state") or "").upper() == "CLOSED" and remote_sha == head:
+            return "cleaned", _archive_and_remove(
+                router, mapping, reason=f"pr_{pr.get('number')}_closed", dry_run=dry_run,
+            )
+
+        reason = "active_or_recent"
+        if head != mapping.base_sha and remote_sha != head:
+            reason = "unpushed_commits"
+        elif remote_sha == head:
+            reason = "pushed_branch"
+        return "retained", {"session_id": mapping.session_id, "reason": reason}
+
+
+def cleanup_stale(
+    router: Router,
+    *,
+    ttl_hours: int = DEFAULT_CLEANUP_TTL_HOURS,
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    if not 1 <= ttl_hours <= 24 * 365:
+        raise RouterError("cleanup ttl_hours must be between 1 and 8760")
+    config = router.config()
+    with router._connect(config) as conn:
+        rows = conn.execute(
+            """
+            SELECT tm.*,
+                   (julianday('now') - julianday(tm.updated_at)) * 24.0 AS idle_hours
+            FROM thread_mappings tm
+            LEFT JOIN archived_threads a
+              ON a.workspace_id=tm.workspace_id
+             AND a.channel_id=tm.channel_id
+             AND a.thread_ts=tm.thread_ts
+            WHERE a.workspace_id IS NULL
+            ORDER BY tm.updated_at
+            """
+        ).fetchall()
+
+    summary: dict[str, Any] = {"ttl_hours": ttl_hours, "dry_run": dry_run,
+                               "cleaned": [], "retained": [], "errors": []}
+    for row in rows:
+        mapping = router._row_to_mapping(row)
+        try:
+            bucket, detail = _evaluate_cleanup(
+                router, mapping, idle_hours=float(row["idle_hours"] or 0),
+                ttl_hours=ttl_hours, explicit_abandon=False, dry_run=dry_run,
+            )
+            summary[bucket].append(detail)
+        except Exception as exc:
+            error_id = getattr(exc, "error_id", uuid.uuid4().hex[:12])
+            detail = {"session_id": mapping.session_id, "branch": mapping.branch,
+                      "error_id": error_id, "error": safe_detail(exc, 800)}
+            summary["errors"].append(detail)
+            _log("cleanup_failed", **detail)
+    _log(
+        "cleanup_completed",
+        cleaned=len(summary["cleaned"]), retained=len(summary["retained"]),
+        errors=len(summary["errors"]), dry_run=dry_run, ttl_hours=ttl_hours,
+    )
+    return summary
+
+
+def abandon_workspace(router: Router, session_id: str) -> dict[str, Any]:
+    mapping = router.lookup(session_id)
+    if mapping is None:
+        raise RouterError("this Slack thread has no active coding workspace")
+    bucket, detail = _evaluate_cleanup(
+        router, mapping, idle_hours=0, ttl_hours=DEFAULT_CLEANUP_TTL_HOURS,
+        explicit_abandon=True, dry_run=False,
+    )
+    if bucket != "cleaned":
+        raise RouterError(f"workspace could not be abandoned: {detail.get('reason')}")
+    return detail
 
 
 def _parse_codex_jsonl(stdout: str) -> tuple[str, str]:
@@ -157,17 +393,14 @@ def _run_codex(router: Router, mapping: Mapping, prompt: str) -> dict[str, Any]:
     if not config.codex_home.is_dir():
         raise RouterError(f"Codex home is missing: {config.codex_home}")
 
-    lock_dir = config.state_db.parent / "locks"
-    lock_dir.mkdir(parents=True, exist_ok=True)
-    lock_key = f"{mapping.workspace_id}:{mapping.channel_id}:{mapping.thread_ts}".encode()
-    lock_name = f"codex-{hashlib.sha256(lock_key).hexdigest()[:16]}.lock"
-    lock_path = lock_dir / lock_name
+    lock_path = _codex_lock_path(router, mapping)
     with lock_path.open("a+") as lock_file:
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as exc:
             raise RouterError("Atlas is already handling another message in this Slack thread") from exc
 
+        _touch_mapping(router, mapping)
         prior_thread_id = _codex_session(router, mapping)
         common = [
             "--json",
@@ -333,6 +566,18 @@ def _dispatch(router: Router, request: dict[str, Any]) -> dict[str, Any]:
         raw_path = str(request.get("path") or ".")
         resolved = router._inside_local(mapping.worktree, raw_path)
         return {"path": str(resolved)}
+
+    if operation == "cleanup":
+        try:
+            ttl_hours = int(request.get("ttl_hours", DEFAULT_CLEANUP_TTL_HOURS))
+        except (TypeError, ValueError) as exc:
+            raise RouterError("cleanup ttl_hours must be an integer") from exc
+        return {"summary": cleanup_stale(
+            router, ttl_hours=ttl_hours, dry_run=bool(request.get("dry_run", False))
+        )}
+
+    if operation == "abandon":
+        return {"workspace": abandon_workspace(router, _required(request, "session_id"))}
 
     if operation == "codex_run":
         session_id = _required(request, "session_id")

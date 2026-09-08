@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import inspect
 import logging
+import re
 import uuid
 from typing import Any
 
@@ -16,6 +17,7 @@ ROUTER = Router()
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 _ROUTED_SESSIONS: set[str] = set()
 STARTED_NOTICE_DELAY_SECONDS = 20
+_SLACK_MENTION = re.compile(r"<@[A-Z0-9]+>")
 
 
 def _slack_adapter(gateway: Any) -> Any | None:
@@ -190,6 +192,57 @@ async def _run_atlas_turn(
         )
 
 
+def _is_abandon_command(prompt: str) -> bool:
+    normalized = _SLACK_MENTION.sub("", prompt).strip().lower().rstrip(".! ")
+    return normalized in {"abandon", "abandon thread", "abandon this thread"}
+
+
+async def _run_abandon(
+    *,
+    gateway: Any,
+    session_id: str,
+    workspace_id: str,
+    channel_id: str,
+    thread_ts: str,
+) -> None:
+    try:
+        result = await asyncio.to_thread(ROUTER.abandon, session_id)
+        workspace = result.get("workspace") or {}
+        await _deliver_slack(
+            gateway,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            workspace_id=workspace_id,
+            event_name="atlas_abandoned",
+            content=(
+                ":wastebasket: *Atlas removed this untouched coding workspace.*\n"
+                f"Repository: `{workspace.get('github_repo', 'unknown')}`\n"
+                f"Branch: `{workspace.get('branch', 'unknown')}`\n"
+                "No work was discarded. Start a new top-level Slack thread for future work."
+            ),
+        )
+    except Exception as exc:
+        error_id = getattr(exc, "error_id", uuid.uuid4().hex[:12])
+        log_event(
+            logging.ERROR,
+            "atlas_abandon_failed",
+            error_id=error_id,
+            session_id=session_id,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            error=str(exc),
+        )
+        await _deliver_slack(
+            gateway,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            workspace_id=workspace_id,
+            event_name="atlas_error",
+            error_id=error_id,
+            content=_error_message(error_id, exc),
+        )
+
+
 def _pre_gateway_dispatch(
     event: Any = None,
     gateway: Any = None,
@@ -222,6 +275,16 @@ def _pre_gateway_dispatch(
         if not thread_ts:
             raise RouterError("Slack event has no stable thread timestamp")
         prompt = str(getattr(event, "text", "") or "")
+        if _is_abandon_command(prompt):
+            task = asyncio.get_running_loop().create_task(_run_abandon(
+                gateway=gateway,
+                session_id=session_id,
+                workspace_id=workspace_id,
+                channel_id=channel_id,
+                thread_ts=thread_ts,
+            ))
+            _track_task(task)
+            return {"action": "skip", "reason": "atlas-workspace-abandon-dispatched"}
         channel_context = str(getattr(event, "channel_context", "") or "").strip()
         if channel_context:
             prompt = f"Slack thread context before this request:\n{channel_context}\n\nCurrent request:\n{prompt}"

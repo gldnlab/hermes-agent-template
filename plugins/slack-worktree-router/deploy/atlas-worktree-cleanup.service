@@ -1,0 +1,20 @@
+[Unit]
+Description=Clean inactive Atlas Slack coding worktrees
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=atlas
+Group=atlas
+Environment=HOME=/srv/atlas/home
+Environment=HERMES_SLACK_WORKTREE_HELPER_LOG=/srv/atlas/state/helper.jsonl
+ExecStart=/usr/bin/python3 /opt/hermes-worktree-router/cleanup.py --config /etc/hermes/slack-worktree-routes.yaml --ttl-hours 24
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ReadWritePaths=/srv/atlas
+
+[Install]
+WantedBy=multi-user.target

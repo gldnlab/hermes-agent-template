@@ -7,6 +7,7 @@ Install these plugin files under `/opt/hermes-worktree-router/`:
 
 - `router.py`
 - `remote_helper.py`
+- `cleanup.py`
 
 Install `deploy/atlas-pre-push` as
 `/opt/hermes-worktree-router/git-hooks/pre-push`, root-owned and executable.
@@ -40,6 +41,18 @@ file is root-owned, group-readable by `atlas`, and not writable by that account.
 The helper executable and pre-push guard are root-owned and not writable by
 `atlas`.
 
+Install `deploy/atlas-worktree-cleanup.service` and
+`deploy/atlas-worktree-cleanup.timer` under `/etc/systemd/system/`, then run:
+
+```text
+systemctl daemon-reload
+systemctl enable --now atlas-worktree-cleanup.timer
+```
+
+The timer runs daily as the unprivileged `atlas` user. It expires untouched
+workspaces after 24 hours and safely handles concluded PRs. Cleanup records are
+written to `/srv/atlas/state/helper.jsonl` and the systemd journal.
+
 If Codex needs a GitHub token, put only the required runtime values in
 `/etc/hermes/atlas.env`, owned by root and mode `0600`. The wrapper sources that
 file without printing it. Do not reuse or source a Buzz service environment.
@@ -55,7 +68,7 @@ JSON operations, not an arbitrary shell. One of those operations launches
 Codex inside a previously verified mapped worktree; it cannot choose an
 unregistered path. The helper accepts one request on stdin and returns one JSON
 response on stdout. It logs matching request and error IDs to stderr (which
-Railway records) and to `/var/log/hermes-worktree-helper.jsonl`.
+Railway records) and to `/srv/atlas/state/helper.jsonl`.
 
 Before enabling the Railway plugin, test the forced-command path with the same
 key it will use:

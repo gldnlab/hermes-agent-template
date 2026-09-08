@@ -562,6 +562,21 @@ class Router:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS archived_threads (
+                workspace_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                thread_ts TEXT NOT NULL,
+                session_id TEXT NOT NULL,
+                github_repo TEXT NOT NULL,
+                branch TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                archived_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(workspace_id, channel_id, thread_ts)
+            )
+            """
+        )
         return conn
 
     @staticmethod
@@ -687,6 +702,17 @@ class Router:
         with self._lock, lock_path.open("a+") as lock_file:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
             with self._connect(config) as conn:
+                archived = conn.execute(
+                    "SELECT reason, archived_at FROM archived_threads "
+                    "WHERE workspace_id=? AND channel_id=? AND thread_ts=?",
+                    (workspace_id, channel_id, thread_ts),
+                ).fetchone()
+                if archived:
+                    raise RouterError(
+                        "this Slack thread's coding workspace was archived "
+                        f"({archived['reason']} at {archived['archived_at']} UTC); "
+                        "start a new top-level Slack thread for more work"
+                    )
                 row = conn.execute(
                     "SELECT * FROM thread_mappings WHERE workspace_id=? AND channel_id=? AND thread_ts=?",
                     (workspace_id, channel_id, thread_ts),
@@ -703,6 +729,13 @@ class Router:
                             for key in Mapping.__dataclass_fields__
                             if key != "session_id"
                         })
+                    else:
+                        conn.execute(
+                            "UPDATE thread_mappings SET updated_at=CURRENT_TIMESTAMP "
+                            "WHERE session_id=?",
+                            (session_id,),
+                        )
+                    conn.commit()
                     self._verify_or_recover(mapping, config)
                     return mapping
 
@@ -982,6 +1015,12 @@ class Router:
                 "action": "block",
                 "message": f"{PLUGIN_NAME} [{error_id}]: {safe_detail(exc, 800)}",
             }
+
+    def abandon(self, session_id: str) -> dict[str, Any]:
+        config = self.config()
+        if config.backend != "ssh":
+            raise RouterError("workspace abandon is only supported through the SSH helper")
+        return self._remote_request(config, "abandon", session_id=session_id)
 
     @staticmethod
     def prompt(mapping: Mapping) -> str:
