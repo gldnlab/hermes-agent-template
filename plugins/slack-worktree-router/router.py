@@ -995,8 +995,9 @@ class Router:
             "GitHub is the source of truth. Keep the request and decisions in a "
             "GitHub issue or PR, commit only to the mapped branch, run the "
             "repository's verification, push the branch, and open a PR. Never "
-            "merge or change production configuration. In your first reply, "
-            "show Repository, Branch, Base, and Workspace."
+            "merge or change production configuration. Hermes reports the "
+            "workspace, branch, base, model, and reasoning effort separately; "
+            "do not repeat those details in your response."
         )
 
 

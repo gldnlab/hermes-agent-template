@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import inspect
 import logging
 import uuid
@@ -14,6 +15,7 @@ from .router import Router, RouterError, authorized_route, log_event, normalize_
 ROUTER = Router()
 _BACKGROUND_TASKS: set[asyncio.Task] = set()
 _ROUTED_SESSIONS: set[str] = set()
+STARTED_NOTICE_DELAY_SECONDS = 20
 
 
 def _slack_adapter(gateway: Any) -> Any | None:
@@ -71,6 +73,41 @@ def _error_message(error_id: str, detail: Any) -> str:
     )
 
 
+def _workspace_message(mapping: Any, config: Any, *, working: bool) -> str:
+    heading = (
+        ":gear: *Atlas is working in an isolated Codex workspace.*"
+        if working
+        else ":white_check_mark: *Atlas used an isolated Codex workspace.*"
+    )
+    return (
+        f"{heading}\n"
+        f"Repository: `{mapping.github_repo}`\n"
+        f"Branch: `{mapping.branch}`\n"
+        f"Base: `{mapping.base_branch}` @ `{mapping.base_sha[:12]}`\n"
+        f"Model: `{config.codex_model}` · reasoning: `{config.codex_reasoning_effort}`\n"
+        "GitHub is the source of truth."
+    )
+
+
+async def _deliver_started_after_delay(
+    gateway: Any,
+    *,
+    channel_id: str,
+    thread_ts: str,
+    workspace_id: str,
+    content: str,
+) -> bool:
+    await asyncio.sleep(STARTED_NOTICE_DELAY_SECONDS)
+    return await _deliver_slack(
+        gateway,
+        channel_id=channel_id,
+        thread_ts=thread_ts,
+        workspace_id=workspace_id,
+        event_name="atlas_started",
+        content=content,
+    )
+
+
 def _schedule_error(
     gateway: Any,
     *,
@@ -103,6 +140,7 @@ async def _run_atlas_turn(
     user_id: str,
     prompt: str,
 ) -> None:
+    started_task: asyncio.Task | None = None
     try:
         mapping = await asyncio.to_thread(
             ROUTER.provision, session_id=session_id, workspace_id=workspace_id,
@@ -113,28 +151,35 @@ async def _run_atlas_turn(
                   thread_ts=mapping.thread_ts, github_repo=mapping.github_repo,
                   branch=mapping.branch, base_sha=mapping.base_sha)
         config = ROUTER.config()
-        await _deliver_slack(
-            gateway, channel_id=channel_id, thread_ts=thread_ts, workspace_id=workspace_id,
-            event_name="atlas_started",
-            content=(
-                ":gear: *Atlas is working in an isolated Codex workspace.*\n"
-                f"Repository: `{mapping.github_repo}`\n"
-                f"Branch: `{mapping.branch}`\n"
-                f"Base: `{mapping.base_branch}` @ `{mapping.base_sha[:12]}`\n"
-                f"Model: `{config.codex_model}` · reasoning: `{config.codex_reasoning_effort}`\n"
-                "GitHub is the source of truth."
-            ),
-        )
+        started_task = asyncio.create_task(_deliver_started_after_delay(
+            gateway,
+            channel_id=channel_id,
+            thread_ts=thread_ts,
+            workspace_id=workspace_id,
+            content=_workspace_message(mapping, config, working=True),
+        ))
         result = await asyncio.to_thread(
             ROUTER.run_codex, mapping, f"{ROUTER.prompt(mapping)}\n\nSlack request:\n{prompt}"
         )
+        started_sent = False
+        if started_task.done():
+            started_sent = bool(await started_task)
+        else:
+            started_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await started_task
+        final_content = result["final"]
+        if not started_sent:
+            final_content = f"{_workspace_message(mapping, config, working=False)}\n\n{final_content}"
         await _deliver_slack(
             gateway, channel_id=channel_id, thread_ts=thread_ts, workspace_id=workspace_id,
-            event_name="atlas_final", content=result["final"],
+            event_name="atlas_final", content=final_content,
         )
         log_event(logging.INFO, "atlas_turn_succeeded", session_id=mapping.session_id,
                   codex_thread_id=result["codex_thread_id"], resumed=result["resumed"])
     except Exception as exc:
+        if started_task is not None and not started_task.done():
+            started_task.cancel()
         error_id = getattr(exc, "error_id", uuid.uuid4().hex[:12])
         log_event(logging.ERROR, "atlas_turn_failed", error_id=error_id, session_id=session_id,
                   workspace_id=workspace_id, channel_id=channel_id, thread_ts=thread_ts,

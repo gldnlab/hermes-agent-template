@@ -553,7 +553,9 @@ def test_mapped_slack_message_is_dispatched_to_codex_without_hermes_fallback(con
         await asyncio.gather(*list(module._BACKGROUND_TASKS))
 
     asyncio.run(scenario())
-    assert [item[1] for item in adapter.sent][-1] == "Done."
+    assert len(adapter.sent) == 1
+    assert "Model: `gpt-6-astra` · reasoning: `medium`" in adapter.sent[0][1]
+    assert adapter.sent[0][1].endswith("Done.")
     assert all(item[2] == "1788192345.1204" for item in adapter.sent)
 
 
