@@ -2,6 +2,6 @@ name: slack-worktree-router
 version: "0.3.0"
 description: Route authorized Slack threads to persistent, isolated Codex sessions on a remote coding host.
 api_version: 1
-hooks:
+provides_hooks:
   - pre_gateway_dispatch
   - pre_tool_call
