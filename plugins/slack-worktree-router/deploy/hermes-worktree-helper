@@ -1,0 +1,16 @@
+#!/bin/sh
+set -eu
+
+# Optional dedicated runtime credentials (for example GH_TOKEN). Keep this
+# root-owned, mode 0600, and never store it in the repository or routes file.
+if [ -r /etc/hermes/atlas.env ]; then
+  set -a
+  . /etc/hermes/atlas.env
+  set +a
+fi
+
+export HERMES_SLACK_WORKTREE_HELPER_LOG=/srv/atlas/state/helper.jsonl
+
+exec /usr/bin/python3 \
+  /opt/hermes-worktree-router/remote_helper.py \
+  --config /etc/hermes/slack-worktree-routes.yaml

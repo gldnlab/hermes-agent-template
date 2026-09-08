@@ -39,6 +39,16 @@ fi
 
 [ ! -f /data/.hermes/.env ] && touch /data/.hermes/.env
 
+# Materialize Atlas's dedicated forced-command SSH key from the Hermes-Team
+# service variable. The private key never lives in the image or repository.
+# Rewriting it on boot also self-heals a stale volume copy after key rotation.
+if [ -n "${HERMES_SLACK_WORKTREE_SSH_PRIVATE_KEY:-}" ]; then
+  umask 077
+  printf '%s\n' "${HERMES_SLACK_WORKTREE_SSH_PRIVATE_KEY}" \
+    > /data/.hermes/atlas-worktree-control
+  chmod 600 /data/.hermes/atlas-worktree-control
+fi
+
 # Bootstrap OAuth tokens from env var (e.g. xAI Grok SuperGrok).
 # Set HERMES_AUTH_JSON_BOOTSTRAP to the contents of a locally-generated
 # ~/.hermes/auth.json. Written only once — subsequent token refreshes update

@@ -1,0 +1,19 @@
+#!/bin/sh
+set -eu
+
+allowed_prefix='refs/heads/atlas/'
+blocked=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  case "$local_ref:$remote_ref" in
+    "$allowed_prefix"*:"$allowed_prefix"*)
+      ;;
+    *)
+      printf 'Atlas push blocked: only atlas/* branches are allowed (attempted %s -> %s).\n' \
+        "$local_ref" "$remote_ref" >&2
+      blocked=1
+      ;;
+  esac
+done
+
+exit "$blocked"

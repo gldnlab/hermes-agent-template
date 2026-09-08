@@ -1,0 +1,73 @@
+version: 1
+
+# Keep authorization explicit because pre_gateway_dispatch runs before
+# Hermes's normal Slack auth check.
+slack_workspace_id: &workspace TLREWAM8X
+slack_allowed_users: &atlas_users
+  - U013H8QQBGT
+
+deny_unmapped: true
+
+# These paths are on the DigitalOcean coding host. SQLite is operational state;
+# GitHub remains the source of truth for code, branches, issues, and PRs.
+state_db: /srv/atlas/state/slack-worktrees.sqlite3
+worktrees_root: /srv/atlas/worktrees
+git_hooks_path: /opt/hermes-worktree-router/git-hooks
+branch_prefix: atlas/slack
+
+workspace_backend:
+  type: ssh
+  helper_command: /usr/local/bin/hermes-worktree-helper
+  timeout: 150
+  # HERMES_SLACK_WORKTREE_SSH_HOST
+  # HERMES_SLACK_WORKTREE_SSH_USER
+  # HERMES_SLACK_WORKTREE_SSH_PORT
+  # HERMES_SLACK_WORKTREE_SSH_KEY
+
+# Atlas invokes Codex directly; no Buzz process participates. This reuses the
+# dedicated Atlas Codex login on the DigitalOcean host.
+codex:
+  binary: /usr/bin/codex
+  home: /srv/atlas/home/.codex
+  sandbox: workspace-write
+  timeout: 3600
+
+# Defense in depth if a mapped session ever reaches Hermes's normal tool loop.
+# Routed requests are intercepted and sent to Codex instead.
+terminal:
+  isolation: workdir
+  network: bridge
+  pass_env: []
+
+slack_repo_routes:
+  # #vw-crm
+  C0BUZL57K97:
+    workspace_id: *workspace
+    repo: /srv/atlas/repos/vw-crm
+    github_repo: gldnlab/vw-crm
+    base_branch: main
+    allowed_users: *atlas_users
+
+  # #vw-hq
+  C0BUTAUA88M:
+    workspace_id: *workspace
+    repo: /srv/atlas/repos/vw-hq
+    github_repo: gldnlab/vw-hq
+    base_branch: main
+    allowed_users: *atlas_users
+
+  # #vw-portal
+  C0BUTATHDAR:
+    workspace_id: *workspace
+    repo: /srv/atlas/repos/vw-dashboards
+    github_repo: gldnlab/vw-dashboards
+    base_branch: main
+    allowed_users: *atlas_users
+
+  # #vw-site
+  C0BV1CCCPS8:
+    workspace_id: *workspace
+    repo: /srv/atlas/repos/vw-site
+    github_repo: gldnlab/vw-site
+    base_branch: main
+    allowed_users: *atlas_users
