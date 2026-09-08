@@ -88,9 +88,11 @@ printf '%s' '{"version":1,"request_id":"health-check","operation":"health"}' |
 The response must be one JSON object with `"ok":true`, and the same
 `health-check` ID must appear in the host log.
 
-Then run the `codex_preflight` operation. It performs one ephemeral
-`workspace-write` turn, verifies an actual marker-file write and read, removes
-the marker, and fails if authentication or the OS sandbox is broken:
+Then run the `codex_preflight` operation. It creates a disposable worktree and
+branch, performs one ephemeral `workspace-write` turn, verifies that Codex can
+write and commit a marker, checks a guarded GitHub push with `--dry-run`, and
+removes the worktree and branch. It fails if authentication, the OS sandbox,
+Git metadata access, or push authorization is broken:
 
 ```text
 printf '%s' '{"version":1,"request_id":"codex-check","operation":"codex_preflight"}' |

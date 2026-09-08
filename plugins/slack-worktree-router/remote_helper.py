@@ -18,6 +18,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -395,13 +396,27 @@ def _run_codex(router: Router, mapping: Mapping, prompt: str) -> dict[str, Any]:
 
     lock_path = _codex_lock_path(router, mapping)
     with lock_path.open("a+") as lock_file:
+        queued = False
+        queue_started = time.monotonic()
         try:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError as exc:
-            raise RouterError("Atlas is already handling another message in this Slack thread") from exc
+        except BlockingIOError:
+            queued = True
+            _log("codex_queued", session_id=mapping.session_id)
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        queue_wait_seconds = round(time.monotonic() - queue_started, 3)
+        if queued:
+            _log(
+                "codex_queue_acquired",
+                session_id=mapping.session_id,
+                wait_seconds=queue_wait_seconds,
+            )
 
         _touch_mapping(router, mapping)
         prior_thread_id = _codex_session(router, mapping)
+        git_metadata = (mapping.repo / ".git").resolve()
+        if not git_metadata.is_dir():
+            raise RouterError(f"repository Git metadata is missing: {git_metadata}")
         common = [
             "--json",
             "--model", config.codex_model,
@@ -409,6 +424,7 @@ def _run_codex(router: Router, mapping: Mapping, prompt: str) -> dict[str, Any]:
             "-c", f'model_reasoning_effort="{config.codex_reasoning_effort}"',
             "-c", f'sandbox_mode="{config.codex_sandbox}"',
             "-c", "sandbox_workspace_write.network_access=true",
+            "-c", f"sandbox_workspace_write.writable_roots={json.dumps([str(git_metadata)])}",
         ]
         if prior_thread_id:
             argv = [
@@ -432,6 +448,8 @@ def _run_codex(router: Router, mapping: Mapping, prompt: str) -> dict[str, Any]:
             model=config.codex_model,
             reasoning_effort=config.codex_reasoning_effort,
             resumed=bool(prior_thread_id),
+            queued=queued,
+            queue_wait_seconds=queue_wait_seconds,
         )
         try:
             result = subprocess.run(
@@ -469,6 +487,7 @@ def _run_codex(router: Router, mapping: Mapping, prompt: str) -> dict[str, Any]:
             "codex_thread_id": thread_id,
             "final": final,
             "resumed": bool(prior_thread_id),
+            "queued": queued,
         }
 
 
@@ -476,57 +495,87 @@ def _codex_preflight(router: Router) -> dict[str, Any]:
     config = router.config()
     route = next(iter(config.routes.values()))
     router._assert_repo(route, config)
-    before = _run_git("status", "--porcelain", cwd=route.repo)
-    if before:
+    if _run_git("status", "--porcelain", cwd=route.repo):
         raise RouterError("Codex preflight repository is not clean")
-    marker = route.repo / f".atlas-codex-write-preflight-{uuid.uuid4().hex[:12]}"
+    preflight_id = uuid.uuid4().hex[:12]
+    branch = f"{config.branch_prefix}-preflight-{preflight_id}"
+    worktree = (config.worktrees_root / ".preflight" / preflight_id).resolve()
+    marker_name = f".atlas-codex-write-preflight-{preflight_id}"
     marker_token = f"ATLAS_SANDBOX_WRITE_{uuid.uuid4().hex}"
     env = os.environ.copy()
     env["CODEX_HOME"] = str(config.codex_home)
-    argv = [
-        config.codex_binary, "exec", "--ephemeral", "--json", "--color", "never",
-        "--model", config.codex_model,
-        "--sandbox", config.codex_sandbox, "-C", str(route.repo),
-        "-c", 'approval_policy="never"',
-        "-c", f'model_reasoning_effort="{config.codex_reasoning_effort}"',
-        "-c", "sandbox_workspace_write.network_access=true", "-",
-    ]
+    base_sha = ""
+    worktree_added = False
     try:
-        result = subprocess.run(
-            argv,
-            input=(
-                "Use the terminal tool to create the relative file "
-                f"{marker.name} containing exactly this text and no newline: "
-                f"{marker_token}. Then use the terminal tool to read the file. "
-                "Leave the file in place and reply with exactly: ATLAS_CODEX_WRITE_OK"
-            ),
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=route.repo,
-            env=env,
-            timeout=min(config.helper_timeout - 5, 120),
-            check=False,
+        _run_git("fetch", "--prune", "origin", route.base_branch, cwd=route.repo)
+        base_sha = _run_git(
+            "rev-parse", "--verify", f"refs/remotes/origin/{route.base_branch}", cwd=route.repo,
         )
-    except subprocess.TimeoutExpired as exc:
-        raise RouterError("Codex authentication preflight timed out") from exc
-    try:
+        worktree.parent.mkdir(parents=True, exist_ok=True)
+        _run_git("worktree", "add", str(worktree), "-b", branch, base_sha, cwd=route.repo)
+        worktree_added = True
+        argv = [
+            config.codex_binary, "exec", "--ephemeral", "--json", "--color", "never",
+            "--model", config.codex_model,
+            "--sandbox", config.codex_sandbox, "-C", str(worktree),
+            "-c", 'approval_policy="never"',
+            "-c", f'model_reasoning_effort="{config.codex_reasoning_effort}"',
+            "-c", "sandbox_workspace_write.network_access=true",
+            "-c", (
+                "sandbox_workspace_write.writable_roots="
+                f"{json.dumps([str((route.repo / '.git').resolve())])}"
+            ),
+            "-",
+        ]
+        try:
+            result = subprocess.run(
+                argv,
+                input=(
+                    "Use the terminal tool to create the relative file "
+                    f"{marker_name} containing exactly this text and no newline: "
+                    f"{marker_token}. Read it back, git add it, and commit it using "
+                    "git -c user.name=Atlas -c user.email=atlas@localhost commit "
+                    "with message 'chore: Atlas sandbox preflight'. Reply with exactly: "
+                    "ATLAS_CODEX_GIT_OK"
+                ),
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=worktree,
+                env=env,
+                timeout=min(config.helper_timeout - 5, 120),
+                check=False,
+            )
+        except subprocess.TimeoutExpired as exc:
+            raise RouterError("Codex Git preflight timed out") from exc
         if result.returncode:
             detail = safe_detail(result.stderr.strip()[-3000:] or result.stdout.strip()[-2000:], 3000)
-            raise RouterError(f"Codex workspace-write preflight failed: {detail}")
+            raise RouterError(f"Codex Git preflight failed: {detail}")
         _thread_id, final = _parse_codex_jsonl(result.stdout)
-        if final.strip() != "ATLAS_CODEX_WRITE_OK":
-            raise RouterError("Codex workspace-write preflight returned an unexpected response")
-        if not marker.is_file() or marker.read_text(encoding="utf-8") != marker_token:
-            raise RouterError("Codex workspace-write preflight did not create the verified marker")
+        if final.strip() != "ATLAS_CODEX_GIT_OK":
+            raise RouterError("Codex Git preflight returned an unexpected response")
+        if _run_git("rev-parse", "HEAD^", cwd=worktree) != base_sha:
+            raise RouterError("Codex Git preflight created an unexpected commit history")
+        committed_marker = _run_git("show", f"HEAD:{marker_name}", cwd=worktree)
+        if committed_marker != marker_token:
+            raise RouterError("Codex Git preflight did not commit the verified marker")
+        if _run_git("status", "--porcelain", cwd=worktree):
+            raise RouterError("Codex Git preflight left its disposable worktree dirty")
+        _run_git(
+            "push", "--dry-run", "origin", f"{branch}:refs/heads/{branch}", cwd=worktree,
+        )
     finally:
-        marker.unlink(missing_ok=True)
-    after = _run_git("status", "--porcelain", cwd=route.repo)
-    if after != before:
-        raise RouterError("Codex workspace-write preflight left the repository dirty")
+        if worktree_added:
+            _run_git("worktree", "remove", "--force", str(worktree), cwd=route.repo)
+        try:
+            _run_git("branch", "-D", branch, cwd=route.repo)
+        except RouterError:
+            pass
     return {
         "authenticated": True,
         "workspace_write": True,
+        "git_commit": True,
+        "push_dry_run": True,
         "model": config.codex_model,
         "reasoning_effort": config.codex_reasoning_effort,
     }

@@ -430,7 +430,9 @@ class Router:
             operation=operation,
             host=config.ssh_host,
         )
-        timeout = config.codex_timeout + 30 if operation == "codex_run" else config.helper_timeout
+        # A same-thread message may wait behind active Codex turns. Keep the
+        # SSH request alive long enough for a small burst to drain in order.
+        timeout = config.codex_timeout * 4 + 30 if operation == "codex_run" else config.helper_timeout
         try:
             result = subprocess.run(
                 self._ssh_argv(config),
@@ -1033,7 +1035,8 @@ class Router:
             f"Workspace: {mapping.worktree} (isolated)\n\n"
             "GitHub is the source of truth. Keep the request and decisions in a "
             "GitHub issue or PR, commit only to the mapped branch, run the "
-            "repository's verification, push the branch, and open a PR. Never "
+            "repository's verification, push using the mapped branch name as "
+            "both the local and remote ref (never HEAD), and open a PR. Never "
             "merge or change production configuration. Hermes reports the "
             "workspace, branch, base, model, and reasoning effort separately; "
             "do not repeat those details in your response."

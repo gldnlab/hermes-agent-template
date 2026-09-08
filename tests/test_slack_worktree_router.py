@@ -7,6 +7,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -531,14 +532,18 @@ def test_codex_preflight_requires_real_workspace_write(
             kwargs["input"],
         )
         assert match is not None
-        (repo / match.group(1)).write_text(match.group(2), encoding="utf-8")
+        worktree = Path(kwargs["cwd"])
+        (worktree / match.group(1)).write_text(match.group(2), encoding="utf-8")
+        git(worktree, "add", match.group(1))
+        git(worktree, "-c", "user.name=Atlas", "-c", "user.email=atlas@localhost",
+            "commit", "-m", "chore: Atlas sandbox preflight")
         return SimpleNamespace(
             returncode=0,
             stdout="\n".join([
                 json.dumps({"type": "thread.started", "thread_id": "preflight-thread"}),
                 json.dumps({
                     "type": "item.completed",
-                    "item": {"type": "agent_message", "text": "ATLAS_CODEX_WRITE_OK"},
+                    "item": {"type": "agent_message", "text": "ATLAS_CODEX_GIT_OK"},
                 }),
             ]),
             stderr="",
@@ -547,7 +552,8 @@ def test_codex_preflight_requires_real_workspace_write(
     monkeypatch.setattr(helper.subprocess, "run", completed)
     result = helper._codex_preflight(router)
     assert result["workspace_write"] is True
-    assert not list(repo.glob(".atlas-codex-write-preflight-*"))
+    assert result["git_commit"] is True
+    assert result["push_dry_run"] is True
     assert git(repo, "status", "--porcelain") == ""
 
 
@@ -684,6 +690,7 @@ def test_codex_runner_persists_and_resumes_thread(
         "codex_thread_id": "codex-thread-1",
         "final": "Finished.",
         "resumed": False,
+        "queued": False,
     }
     assert second["resumed"] is True
     assert "resume" not in commands[0]
@@ -691,7 +698,78 @@ def test_codex_runner_persists_and_resumes_thread(
     assert "codex-thread-1" in commands[1]
     for command in commands:
         assert command[command.index("--model") + 1] == "gpt-6-astra"
+        assert (
+            "sandbox_workspace_write.writable_roots="
+            f'{json.dumps([str((mapping.repo / ".git").resolve())])}'
+        ) in command
         assert 'model_reasoning_effort="medium"' in command
+
+
+def test_codex_runner_queues_overlapping_same_thread_turns(
+    configured_router, router_module, monkeypatch
+):
+    router, _ = configured_router
+    mapping = provision(router)
+    sys.modules["router"] = router_module
+    spec = importlib.util.spec_from_file_location(
+        "slack_worktree_router_helper_queue",
+        PLUGIN_DIR / "remote_helper.py",
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    first_entered = threading.Event()
+    release_first = threading.Event()
+    second_entered = threading.Event()
+    calls = 0
+    calls_lock = threading.Lock()
+    real_run = subprocess.run
+
+    def completed(argv, **kwargs):
+        nonlocal calls
+        if argv[0] != sys.executable:
+            return real_run(argv, **kwargs)
+        with calls_lock:
+            calls += 1
+            call_number = calls
+        if call_number == 1:
+            first_entered.set()
+            assert release_first.wait(2)
+        else:
+            second_entered.set()
+        return SimpleNamespace(
+            returncode=0,
+            stdout="\n".join([
+                json.dumps({"type": "thread.started", "thread_id": "codex-thread-1"}),
+                json.dumps({
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "Finished."},
+                }),
+            ]),
+            stderr="",
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", completed)
+    results = []
+    first = threading.Thread(
+        target=lambda: results.append(module._run_codex(router, mapping, "first"))
+    )
+    second = threading.Thread(
+        target=lambda: results.append(module._run_codex(router, mapping, "second"))
+    )
+    first.start()
+    assert first_entered.wait(2)
+    second.start()
+    assert not second_entered.wait(0.2)
+    release_first.set()
+    first.join(2)
+    second.join(2)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert calls == 2
+    assert any(result["queued"] for result in results)
 
 
 def test_pre_push_guard_allows_only_atlas_branches():
