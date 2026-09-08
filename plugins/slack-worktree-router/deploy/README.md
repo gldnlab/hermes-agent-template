@@ -26,6 +26,13 @@ Install PyYAML for `/usr/bin/python3`. Install the
 runtime user. Install the populated route configuration as
 `/etc/hermes/slack-worktree-routes.yaml`.
 
+Ubuntu hosts with `kernel.apparmor_restrict_unprivileged_userns=1` must also
+install `deploy/codex-bwrap.apparmor` under `/etc/apparmor.d/codex-bwrap` and
+load it with `apparmor_parser -r /etc/apparmor.d/codex-bwrap`. This grants the
+`userns` permission only to Codex's bundled bubblewrap executable; do not
+disable AppArmor's global user-namespace restriction. Revalidate the profile
+path whenever the Codex package layout changes.
+
 Pre-create the operational paths with private permissions:
 
 ```text
@@ -81,8 +88,9 @@ printf '%s' '{"version":1,"request_id":"health-check","operation":"health"}' |
 The response must be one JSON object with `"ok":true`, and the same
 `health-check` ID must appear in the host log.
 
-Then run the `codex_preflight` operation. It performs one ephemeral read-only
-turn and fails on an expired or invalid refresh token:
+Then run the `codex_preflight` operation. It performs one ephemeral
+`workspace-write` turn, verifies an actual marker-file write and read, removes
+the marker, and fails if authentication or the OS sandbox is broken:
 
 ```text
 printf '%s' '{"version":1,"request_id":"codex-check","operation":"codex_preflight"}' |

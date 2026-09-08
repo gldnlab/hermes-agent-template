@@ -476,19 +476,30 @@ def _codex_preflight(router: Router) -> dict[str, Any]:
     config = router.config()
     route = next(iter(config.routes.values()))
     router._assert_repo(route, config)
+    before = _run_git("status", "--porcelain", cwd=route.repo)
+    if before:
+        raise RouterError("Codex preflight repository is not clean")
+    marker = route.repo / f".atlas-codex-write-preflight-{uuid.uuid4().hex[:12]}"
+    marker_token = f"ATLAS_SANDBOX_WRITE_{uuid.uuid4().hex}"
     env = os.environ.copy()
     env["CODEX_HOME"] = str(config.codex_home)
     argv = [
         config.codex_binary, "exec", "--ephemeral", "--json", "--color", "never",
         "--model", config.codex_model,
-        "--sandbox", "read-only", "-C", str(route.repo),
+        "--sandbox", config.codex_sandbox, "-C", str(route.repo),
         "-c", 'approval_policy="never"',
-        "-c", f'model_reasoning_effort="{config.codex_reasoning_effort}"', "-",
+        "-c", f'model_reasoning_effort="{config.codex_reasoning_effort}"',
+        "-c", "sandbox_workspace_write.network_access=true", "-",
     ]
     try:
         result = subprocess.run(
             argv,
-            input="Reply with exactly: ATLAS_CODEX_OK",
+            input=(
+                "Use the terminal tool to create the relative file "
+                f"{marker.name} containing exactly this text and no newline: "
+                f"{marker_token}. Then use the terminal tool to read the file. "
+                "Leave the file in place and reply with exactly: ATLAS_CODEX_WRITE_OK"
+            ),
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -499,14 +510,23 @@ def _codex_preflight(router: Router) -> dict[str, Any]:
         )
     except subprocess.TimeoutExpired as exc:
         raise RouterError("Codex authentication preflight timed out") from exc
-    if result.returncode:
-        detail = safe_detail(result.stderr.strip()[-3000:] or result.stdout.strip()[-2000:], 3000)
-        raise RouterError(f"Codex authentication preflight failed: {detail}")
-    _thread_id, final = _parse_codex_jsonl(result.stdout)
-    if final.strip() != "ATLAS_CODEX_OK":
-        raise RouterError("Codex authentication preflight returned an unexpected response")
+    try:
+        if result.returncode:
+            detail = safe_detail(result.stderr.strip()[-3000:] or result.stdout.strip()[-2000:], 3000)
+            raise RouterError(f"Codex workspace-write preflight failed: {detail}")
+        _thread_id, final = _parse_codex_jsonl(result.stdout)
+        if final.strip() != "ATLAS_CODEX_WRITE_OK":
+            raise RouterError("Codex workspace-write preflight returned an unexpected response")
+        if not marker.is_file() or marker.read_text(encoding="utf-8") != marker_token:
+            raise RouterError("Codex workspace-write preflight did not create the verified marker")
+    finally:
+        marker.unlink(missing_ok=True)
+    after = _run_git("status", "--porcelain", cwd=route.repo)
+    if after != before:
+        raise RouterError("Codex workspace-write preflight left the repository dirty")
     return {
         "authenticated": True,
+        "workspace_write": True,
         "model": config.codex_model,
         "reasoning_effort": config.codex_reasoning_effort,
     }

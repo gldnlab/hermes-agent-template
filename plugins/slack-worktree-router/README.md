@@ -92,8 +92,10 @@ python /opt/hermes-agent/plugins/slack-worktree-router/diagnose.py
 ```
 
 The diagnostic verifies the route fingerprint on both hosts and performs one
-ephemeral, read-only Codex turn. This catches expired refresh tokens that
-`codex login status` can incorrectly describe as logged in.
+ephemeral Codex turn using the production `workspace-write` sandbox. Codex must
+create and read a unique marker; the helper verifies and removes it and checks
+that Git remains clean. This catches both expired refresh tokens and OS sandbox
+failures that a text-only or read-only check would miss.
 
 ## Lifecycle
 

@@ -1,0 +1,11 @@
+# Allow only Codex's bundled bubblewrap launcher to create its unprivileged
+# user namespace. Ubuntu's global AppArmor userns restriction stays enabled.
+
+abi <abi/4.0>,
+include <tunables/global>
+
+profile codex-bwrap /usr/lib/node_modules/@openai/codex/node_modules/@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/codex-resources/bwrap flags=(unconfined) {
+  userns,
+
+  include if exists <local/codex-bwrap>
+}

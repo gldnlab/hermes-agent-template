@@ -4,6 +4,7 @@ import asyncio
 import importlib.util
 import json
 import os
+import re
 import subprocess
 import sys
 from dataclasses import replace
@@ -503,6 +504,51 @@ def test_codex_jsonl_parser_surfaces_turn_failure(router_module):
                 "error": {"message": "Your refresh token is expired"},
             }),
         ]))
+
+
+def test_codex_preflight_requires_real_workspace_write(
+    configured_router, router_module, monkeypatch
+):
+    router, repo = configured_router
+    sys.modules["router"] = router_module
+    spec = importlib.util.spec_from_file_location(
+        "slack_worktree_router_helper_preflight",
+        PLUGIN_DIR / "remote_helper.py",
+    )
+    helper = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = helper
+    assert spec.loader is not None
+    spec.loader.exec_module(helper)
+    real_run = subprocess.run
+
+    def completed(argv, **kwargs):
+        if argv[0] != sys.executable:
+            return real_run(argv, **kwargs)
+        assert argv[argv.index("--sandbox") + 1] == "workspace-write"
+        assert "sandbox_workspace_write.network_access=true" in argv
+        match = re.search(
+            r"relative file (\S+) containing exactly this text and no newline: (\S+)\.",
+            kwargs["input"],
+        )
+        assert match is not None
+        (repo / match.group(1)).write_text(match.group(2), encoding="utf-8")
+        return SimpleNamespace(
+            returncode=0,
+            stdout="\n".join([
+                json.dumps({"type": "thread.started", "thread_id": "preflight-thread"}),
+                json.dumps({
+                    "type": "item.completed",
+                    "item": {"type": "agent_message", "text": "ATLAS_CODEX_WRITE_OK"},
+                }),
+            ]),
+            stderr="",
+        )
+
+    monkeypatch.setattr(helper.subprocess, "run", completed)
+    result = helper._codex_preflight(router)
+    assert result["workspace_write"] is True
+    assert not list(repo.glob(".atlas-codex-write-preflight-*"))
+    assert git(repo, "status", "--porcelain") == ""
 
 
 def test_mapped_slack_message_is_dispatched_to_codex_without_hermes_fallback(configured_router):

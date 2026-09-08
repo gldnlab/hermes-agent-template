@@ -55,13 +55,14 @@ def main() -> int:
             preflight = router._remote_request(config, "codex_preflight")
             preflight_matches = (
                 preflight.get("authenticated") is True
+                and preflight.get("workspace_write") is True
                 and preflight.get("model") == config.codex_model
                 and preflight.get("reasoning_effort") == config.codex_reasoning_effort
             )
             check(
                 "codex_auth",
                 preflight_matches,
-                f"fresh read-only {config.codex_model}/{config.codex_reasoning_effort} turn succeeded",
+                f"fresh workspace-write {config.codex_model}/{config.codex_reasoning_effort} turn succeeded",
             )
     except Exception as exc:
         check("diagnostic_exception", False, f"{type(exc).__name__}: {exc}")
