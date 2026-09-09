@@ -3,15 +3,21 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from router import Router, config_fingerprint
 
 
 def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--transport-only', action='store_true',
+                        help='exercise repeated SSH polls without running Codex or creating a worktree')
+    args = parser.parse_args()
     checks: list[dict[str, object]] = []
 
     def check(name: str, ok: bool, detail: str) -> None:
@@ -55,6 +61,21 @@ def main() -> int:
                 response.get("codex_reasoning_effort") == config.codex_reasoning_effort,
                 f"helper pins {response.get('codex_reasoning_effort')} reasoning",
             )
+            if args.transport_only:
+                socket = Path(next(arg.split('=', 1)[1] for arg in router._ssh_argv(config)
+                                   if arg.startswith('ControlPath=')))
+                inodes = {socket.stat().st_ino}
+                for _ in range(12):
+                    time.sleep(3)
+                    poll = router._remote_request(config, 'health')
+                    if poll.get('config_fingerprint') != config_fingerprint(config):
+                        raise RuntimeError('helper identity changed during repeated SSH checks')
+                    inodes.add(socket.stat().st_ino)
+                check('ssh_poll_reuse', len(inodes) == 1,
+                      '13 helper requests over 36+ seconds used one SSH connection socket')
+                ok = all(bool(item['ok']) for item in checks)
+                print(json.dumps({'ok': ok, 'checks': checks}, indent=2, sort_keys=True))
+                return 0 if ok else 1
             preflight = router._remote_request(config, "codex_preflight")
             preflight_matches = (
                 preflight.get("authenticated") is True

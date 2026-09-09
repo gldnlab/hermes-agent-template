@@ -561,8 +561,88 @@ def test_remote_helper_failure_has_searchable_error_id(configured_router, router
     assert payload["error_id"] in result.stderr
 
 
-def test_remote_client_preserves_helper_error_id(configured_router, router_module, monkeypatch):
+def test_ssh_polls_reuse_private_credential_specific_socket(configured_router, router_module, monkeypatch, tmp_path):
     router, _ = configured_router
+    monkeypatch.setattr(router_module, '_SSH_RUNTIME_ROOT', tmp_path)
+    config = replace(router.config(), ssh_host='coding.example', ssh_user='atlas', ssh_key='')
+    first = router._ssh_argv(config)
+    assert first == router._ssh_argv(config)
+    assert 'ControlMaster=auto' in first
+    assert 'ControlPersist=60' in first
+    socket_arg = next(arg for arg in first if arg.startswith('ControlPath='))
+    socket = Path(socket_arg.split('=', 1)[1])
+    assert socket.parent.stat().st_mode & 0o777 == 0o700
+    for other in (replace(config, ssh_user='other'), replace(config, ssh_port=2222),
+                  replace(config, ssh_key='/different/key')):
+        assert socket_arg not in router._ssh_argv(other)
+    key = tmp_path / 'key'
+    key.write_text('first credential')
+    keyed = replace(config, ssh_key=str(key))
+    before = router._ssh_argv(keyed)
+    key.write_text('replacement credential')
+    assert before != router._ssh_argv(keyed)
+
+
+@pytest.mark.parametrize('symlink', [False, True])
+def test_ssh_rejects_unsafe_socket_directory(configured_router, router_module, monkeypatch, tmp_path, symlink):
+    router, _ = configured_router
+    monkeypatch.setattr(router_module, '_SSH_RUNTIME_ROOT', tmp_path)
+    root = tmp_path / f'atlas-ssh-{os.getuid()}'
+    if symlink:
+        target = tmp_path / 'target'
+        target.mkdir(mode=0o700)
+        root.symlink_to(target)
+    else:
+        root.mkdir(mode=0o755)
+        root.chmod(0o755)
+    with pytest.raises(router_module.RouterError, match='0700'):
+        router._ssh_argv(router.config())
+
+
+def test_ssh_connection_lock_is_bounded(configured_router, router_module, monkeypatch, tmp_path):
+    router, _ = configured_router
+    monkeypatch.setattr(router_module, '_SSH_RUNTIME_ROOT', tmp_path)
+    argv = router._ssh_argv(router.config())
+    with router._ssh_request_lock(argv, 1):
+        with pytest.raises(subprocess.TimeoutExpired):
+            with router._ssh_request_lock(argv, 0.01):
+                pytest.fail('parallel SSH request bypassed the shared connection lock')
+    with router._ssh_request_lock(argv, 1) as remaining:
+        assert 0 < remaining <= 1
+
+
+def test_transport_diagnostic_never_runs_codex(configured_router, router_module, monkeypatch, tmp_path, capsys):
+    router, _ = configured_router
+    key = tmp_path / 'control-key'
+    key.write_text('test-only')
+    config = replace(router.config(), backend='ssh', ssh_key=str(key))
+    socket = tmp_path / 'socket'
+    socket.touch()
+    calls = []
+    def remote(config, operation):
+        calls.append(operation)
+        assert operation == 'health'
+        return dict(backend='local', routes=1, config_fingerprint=router_module.config_fingerprint(config),
+                    codex_binary_present=True, codex_home_present=True, job_protocol=1,
+                    worker_running=True, codex_model=config.codex_model,
+                    codex_reasoning_effort=config.codex_reasoning_effort)
+    monkeypatch.setitem(sys.modules, 'router', router_module)
+    spec = importlib.util.spec_from_file_location('transport_diagnose', PLUGIN_DIR / 'diagnose.py')
+    diagnostic = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(diagnostic)
+    monkeypatch.setattr(diagnostic, 'Router', lambda: SimpleNamespace(
+        config=lambda:config, _remote_request=remote, _ssh_argv=lambda _: [f'ControlPath={socket}']))
+    monkeypatch.setattr(diagnostic.time, 'sleep', lambda _:None)
+    monkeypatch.setattr(diagnostic.shutil, 'which', lambda _: '/usr/bin/ssh')
+    monkeypatch.setattr(sys, 'argv', ['diagnose.py', '--transport-only'])
+    assert diagnostic.main() == 0
+    assert calls == ['health'] * 13
+    assert json.loads(capsys.readouterr().out)['checks'][-1]['name'] == 'ssh_poll_reuse'
+
+
+def test_remote_client_preserves_helper_error_id(configured_router, router_module, monkeypatch, tmp_path):
+    router, _ = configured_router
+    monkeypatch.setattr(router_module, '_SSH_RUNTIME_ROOT', tmp_path)
     config = replace(
         router.config(),
         backend="ssh",

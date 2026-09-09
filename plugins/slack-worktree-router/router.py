@@ -10,9 +10,12 @@ import os
 import re
 import shlex
 import sqlite3
+import stat
 import subprocess
 import threading
+import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable
@@ -36,6 +39,7 @@ _LIKELY_TOKEN = re.compile(
     r"(?i)\b(?:github_pat_|gh[pousr]_|xox[baprs]-|sk-)[A-Za-z0-9_-]{8,}"
 )
 _AUTH_VALUE = re.compile(r"(?i)(authorization\s*[:=]\s*)(?:bearer\s+)?\S+")
+_SSH_RUNTIME_ROOT = Path('/tmp')
 
 FILE_TOOLS = {"read_file", "write_file", "search_files"}
 PATCH_TOOL = "patch"
@@ -395,6 +399,24 @@ class Router:
         return _load_config()
 
     @staticmethod
+    def _ssh_control_path(config: Config, known_hosts: str) -> Path:
+        # Short, container-local path: Unix sockets have a small path limit.
+        # Share across gateway/diagnostic processes, never across credentials.
+        root = _SSH_RUNTIME_ROOT / f'atlas-ssh-{os.getuid()}'
+        root.mkdir(mode=0o700, exist_ok=True)
+        info = root.lstat()
+        if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid()
+                or stat.S_IMODE(info.st_mode) != 0o700):
+            raise RouterError('Atlas SSH socket directory must be owned by this user with mode 0700')
+        key = Path(config.ssh_key) if config.ssh_key else None
+        key_info = key.stat() if key and key.exists() else None
+        identity = [config.ssh_host, config.ssh_port, config.ssh_user,
+                    config.ssh_key, known_hosts, config.helper_command,
+                    (key_info.st_ino, key_info.st_mtime_ns, key_info.st_size) if key_info else None]
+        digest = hashlib.sha256(json.dumps(identity).encode()).hexdigest()[:24]
+        return root / digest
+
+    @staticmethod
     def _ssh_argv(config: Config) -> list[str]:
         known_hosts = os.environ.get(
             "HERMES_SLACK_WORKTREE_KNOWN_HOSTS",
@@ -408,12 +430,37 @@ class Router:
             "-o", "ConnectTimeout=10",
             "-o", "ServerAliveInterval=30",
             "-o", "ServerAliveCountMax=3",
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=60",
+            "-o", f"ControlPath={Router._ssh_control_path(config, known_hosts)}",
             "-p", str(config.ssh_port),
         ]
         if config.ssh_key:
             argv.extend(["-i", config.ssh_key])
         argv.extend([f"{config.ssh_user}@{config.ssh_host}", config.helper_command])
         return argv
+
+    @staticmethod
+    @contextmanager
+    def _ssh_request_lock(argv: list[str], timeout: float):
+        # Serialize short helper RPCs, including first connection establishment,
+        # so simultaneous processes cannot create a burst of new SSH masters.
+        # Coding runs independently in the DO worker, outside this lock.
+        control = next(arg.split('=', 1)[1] for arg in argv if arg.startswith('ControlPath='))
+        deadline = time.monotonic() + timeout
+        with Path(control + '.lock').open('a+') as lock:
+            while True:
+                try:
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(argv, timeout)
+                    time.sleep(0.05)
+            try:
+                yield max(0.001, deadline - time.monotonic())
+            finally:
+                fcntl.flock(lock, fcntl.LOCK_UN)
 
     def _remote_request(
         self,
@@ -436,15 +483,17 @@ class Router:
         if operation in {'job_submit', 'job_status'}:
             timeout = min(config.helper_timeout, 30)
         try:
-            result = subprocess.run(
-                self._ssh_argv(config),
-                input=json.dumps(request, separators=(",", ":")),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=timeout,
-                check=False,
-            )
+            argv = self._ssh_argv(config)
+            with self._ssh_request_lock(argv, timeout) as remaining:
+                result = subprocess.run(
+                    argv,
+                    input=json.dumps(request, separators=(",", ":")),
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=remaining,
+                    check=False,
+                )
         except subprocess.TimeoutExpired as exc:
             error = RouterError(
                 f"DigitalOcean workspace helper timed out during {operation}",
@@ -492,7 +541,8 @@ class Router:
             )
             log_event(
                 logging.ERROR,
-                "helper_invalid_response",
+                ("helper_connection_interrupted" if result.returncode != 0 and not result.stdout.strip()
+                 else "helper_invalid_response"),
                 request_id=request_id,
                 operation=operation,
                 returncode=result.returncode,

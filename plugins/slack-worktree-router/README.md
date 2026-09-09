@@ -46,6 +46,11 @@ when Slack accepted a post but its acknowledgement was lost. The relay verifies
 the Slack token's workspace and uses a file lock to prevent competing gateways
 from delivering the same queue simultaneously.
 
+Helper requests reuse an OpenSSH connection (60-second idle lifetime), with a
+private, credential-specific socket and a bounded cross-process request lock.
+Do not replace this with a new TCP connection per status poll: DigitalOcean's
+SSH rate limit blocks that polling pattern. Keep the firewall limit enabled.
+
 Later messages in the same Slack thread reuse both the worktree and `codex exec
 resume` session. No Buzz process or Buzz relay participates.
 
@@ -112,6 +117,10 @@ commit a marker in a disposable worktree and the helper checks a guarded push
 dry-run, then removes that worktree. The diagnostic also verifies the durable
 worker is running. Restart/transport/Slack receipt recovery tests are in
 `tests/test_slack_worktree_router.py`.
+
+For a read-only transport check, run `diagnose.py --transport-only`. This checks
+connection reuse across 13 requests over more than 36 seconds, spanning the
+SSH firewall's rate-limit window, without starting Codex or creating a worktree.
 
 ## Lifecycle
 
