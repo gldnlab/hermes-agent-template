@@ -20,13 +20,15 @@ Slack channel + thread timestamp
           GitHub PR
 ```
 
-GitHub is the source of truth. SQLite stores only operational mappings and the
-Codex thread ID needed to resume a conversation after restarts.
+GitHub is the source of truth for code and PRs. SQLite stores operational
+mappings, Codex sessions, jobs, results, and Slack delivery receipts.
 
 ## Behavior
 
-On the first authorized message in a configured channel, the plugin schedules a
-background job and tells Hermes to skip normal dispatch. The helper then:
+On each authorized message, the plugin saves an inbox row on Railway's volume
+before telling Hermes to skip normal dispatch. A relay submits that message
+with a stable ID (workspace + channel + message timestamp) over a short SSH
+request. A separate systemd worker on DigitalOcean then:
 
 1. fetches the mapped repository from GitHub;
 2. records the exact base SHA;
@@ -34,7 +36,15 @@ background job and tells Hermes to skip normal dispatch. The helper then:
 4. starts `codex exec --json` with the configured model and reasoning effort in
    that worktree;
 5. saves the emitted Codex thread ID in SQLite; and
-6. returns Codex's final response through Atlas's existing Slack adapter.
+6. saves Codex's final response to the job database.
+
+The profile's relay polls those saved results and posts through the same Atlas
+Slack identity. It starts on gateway startup, scans unfinished inbox rows, and
+retries interrupted submission or delivery. A single Slack status message is
+updated to the final answer. A stable message metadata marker allows recovery
+when Slack accepted a post but its acknowledgement was lost. The relay verifies
+the Slack token's workspace and uses a file lock to prevent competing gateways
+from delivering the same queue simultaneously.
 
 Later messages in the same Slack thread reuse both the worktree and `codex exec
 resume` session. No Buzz process or Buzz relay participates.
@@ -52,10 +62,15 @@ Slack status message and structured helper logs report both values.
   failures receive searchable error IDs.
 - Errors are posted in the originating Slack thread when Slack is available.
 - Matching structured records go to Railway logs and
-  `/var/log/hermes-worktree-helper.jsonl` on DigitalOcean.
-- If Slack delivery itself fails, that failure is still recorded in Railway.
-- A second message while Codex is already running in the same thread fails
-  explicitly instead of racing two writers.
+  `/srv/atlas/state/helper.jsonl` on DigitalOcean.
+- If Slack delivery fails, the saved result remains pending and is retried.
+- Messages in one thread execute FIFO; separate threads can run concurrently.
+- SSH disconnects are transport failures, never proof that coding failed.
+- Codex event streams are retained in `/srv/atlas/state/job-events/`. After a
+  worker restart, a completed event stream recovers its result. An uncertain
+  turn is marked interrupted and is not blindly replayed. Queued work survives.
+- Gateway shutdown does not need to drain coding work: the systemd worker owns
+  it independently. Slack delivery resumes when the gateway starts again.
 
 ## Configuration
 
@@ -93,9 +108,10 @@ python /opt/hermes-agent/plugins/slack-worktree-router/diagnose.py
 
 The diagnostic verifies the route fingerprint on both hosts and performs one
 ephemeral Codex turn using the production `workspace-write` sandbox. Codex must
-create and read a unique marker; the helper verifies and removes it and checks
-that Git remains clean. This catches both expired refresh tokens and OS sandbox
-failures that a text-only or read-only check would miss.
+commit a marker in a disposable worktree and the helper checks a guarded push
+dry-run, then removes that worktree. The diagnostic also verifies the durable
+worker is running. Restart/transport/Slack receipt recovery tests are in
+`tests/test_slack_worktree_router.py`.
 
 ## Lifecycle
 

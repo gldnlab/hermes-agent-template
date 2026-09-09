@@ -433,6 +433,8 @@ class Router:
         # A same-thread message may wait behind active Codex turns. Keep the
         # SSH request alive long enough for a small burst to drain in order.
         timeout = config.codex_timeout * 4 + 30 if operation == "codex_run" else config.helper_timeout
+        if operation in {'job_submit', 'job_status'}:
+            timeout = min(config.helper_timeout, 30)
         try:
             result = subprocess.run(
                 self._ssh_argv(config),
@@ -483,7 +485,9 @@ class Router:
             response = json.loads(result.stdout)
         except (TypeError, json.JSONDecodeError) as exc:
             error = RouterError(
-                f"DigitalOcean workspace helper returned invalid JSON during {operation}",
+                (f"DigitalOcean connection interrupted during {operation} (SSH exit {result.returncode}); "
+                 "job outcome is unknown" if result.returncode != 0 and not result.stdout.strip()
+                 else f"DigitalOcean workspace helper returned invalid JSON during {operation}"),
                 error_id=request_id,
             )
             log_event(

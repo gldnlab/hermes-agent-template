@@ -42,6 +42,9 @@ def main() -> int:
                   "Codex binary exists on DigitalOcean")
             check("codex_home", bool(response.get("codex_home_present")),
                   "configured Codex home exists on DigitalOcean")
+            check('durable_worker', response.get('job_protocol') == 1
+                  and response.get('worker_running') is True,
+                  'DigitalOcean durable job worker holds its supervision lock')
             check(
                 "codex_model",
                 response.get("codex_model") == config.codex_model,
@@ -56,6 +59,8 @@ def main() -> int:
             preflight_matches = (
                 preflight.get("authenticated") is True
                 and preflight.get("workspace_write") is True
+                and preflight.get("git_commit") is True
+                and preflight.get("push_dry_run") is True
                 and preflight.get("model") == config.codex_model
                 and preflight.get("reasoning_effort") == config.codex_reasoning_effort
             )

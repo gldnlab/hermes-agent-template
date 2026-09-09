@@ -1,0 +1,21 @@
+[Unit]
+Description=Atlas durable coding job worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=atlas
+Group=atlas
+WorkingDirectory=/srv/atlas
+EnvironmentFile=-/etc/hermes/atlas.env
+Environment=HERMES_SLACK_WORKTREE_HELPER_LOG=/srv/atlas/state/helper.jsonl
+ExecStart=/usr/bin/python3 /opt/hermes-worktree-router/remote_helper.py --config /etc/hermes/slack-worktree-routes.yaml --worker
+Restart=on-failure
+RestartSec=3
+KillMode=control-group
+TimeoutStopSec=15
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

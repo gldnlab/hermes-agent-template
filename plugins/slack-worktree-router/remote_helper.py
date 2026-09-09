@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import signal
 import stat
 import subprocess
 import sys
@@ -45,6 +46,7 @@ def _log(event: str, **fields: Any) -> None:
     record = {
         "component": "slack-worktree-helper",
         "event": event,
+        "timestamp": time.time(),
         **{
             key: safe_detail(value) if isinstance(value, str) else value
             for key, value in fields.items()
@@ -114,6 +116,7 @@ def _touch_mapping(router: Router, mapping: Mapping) -> None:
 
 
 def _save_codex_session(router: Router, mapping: Mapping, thread_id: str) -> None:
+    _codex_session(router, mapping)  # also initializes the schema during crash recovery
     config = router.config()
     with router._connect(config) as conn:
         conn.execute(
@@ -252,6 +255,13 @@ def _evaluate_cleanup(
             return "retained", {"session_id": mapping.session_id, "reason": "codex_active"}
 
         router.verify(mapping, config)
+        with router._connect(config) as conn:
+            has_jobs = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='atlas_jobs'").fetchone()
+            if has_jobs:
+                key = json.dumps([mapping.workspace_id, mapping.channel_id, mapping.thread_ts])
+                pending = conn.execute("SELECT 1 FROM atlas_jobs WHERE thread_key=? AND state IN ('queued','running')", (key,)).fetchone()
+                if pending:
+                    return 'retained', {'session_id': mapping.session_id, 'reason': 'job_pending'}
         status = _run_git("status", "--porcelain", cwd=mapping.worktree)
         if status:
             if explicit_abandon:
@@ -386,7 +396,7 @@ def _parse_codex_jsonl(stdout: str) -> tuple[str, str]:
     return thread_id, final
 
 
-def _run_codex(router: Router, mapping: Mapping, prompt: str) -> dict[str, Any]:
+def _run_codex(router: Router, mapping: Mapping, prompt: str, *, job_id: str | None = None) -> dict[str, Any]:
     config = router.config()
     router.verify(mapping, config)
     if not config.codex_binary or not Path(config.codex_binary).is_file():
@@ -413,6 +423,7 @@ def _run_codex(router: Router, mapping: Mapping, prompt: str) -> dict[str, Any]:
             )
 
         _touch_mapping(router, mapping)
+        router.verify(mapping, config)
         prior_thread_id = _codex_session(router, mapping)
         git_metadata = (mapping.repo / ".git").resolve()
         if not git_metadata.is_dir():
@@ -442,6 +453,7 @@ def _run_codex(router: Router, mapping: Mapping, prompt: str) -> dict[str, Any]:
         env["CODEX_HOME"] = str(config.codex_home)
         _log(
             "codex_started",
+            job_id=job_id,
             session_id=mapping.session_id,
             github_repo=mapping.github_repo,
             worktree=str(mapping.worktree),
@@ -452,23 +464,48 @@ def _run_codex(router: Router, mapping: Mapping, prompt: str) -> dict[str, Any]:
             queue_wait_seconds=queue_wait_seconds,
         )
         try:
-            result = subprocess.run(
-                argv,
-                input=prompt,
-                text=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=mapping.worktree,
-                env=env,
-                timeout=config.codex_timeout,
-                check=False,
-            )
+            if job_id:
+                from jobs import validate_id
+                validate_id(job_id)
+                events_dir = config.state_db.parent / 'job-events'
+                events_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                events_path = events_dir / f'{job_id}.jsonl'
+                errors_path = events_dir / f'{job_id}.stderr'
+                # Results survive a dropped SSH connection or gateway restart.
+                with events_path.open('w') as out, errors_path.open('w') as err:
+                    process = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=out,
+                        stderr=err, text=True, cwd=mapping.worktree, env=env,
+                        start_new_session=True)
+                    try:
+                        process.communicate(prompt, timeout=config.codex_timeout)
+                    except subprocess.TimeoutExpired:
+                        os.killpg(process.pid, signal.SIGKILL)
+                        process.wait()
+                        raise
+                result = subprocess.CompletedProcess(argv, process.returncode,
+                    events_path.read_text(), errors_path.read_text())
+            else:
+                result = subprocess.run(
+                    argv, input=prompt, text=True, stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE, cwd=mapping.worktree, env=env,
+                    timeout=config.codex_timeout, check=False,
+                )
         except subprocess.TimeoutExpired as exc:
             raise RouterError(
                 f"Codex exceeded its {config.codex_timeout}-second turn timeout"
             ) from exc
         if len(result.stdout.encode("utf-8", errors="replace")) > MAX_CODEX_OUTPUT_BYTES:
             raise RouterError("Codex JSON event stream exceeded 8 MiB")
+        for line in result.stdout.splitlines():
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(event, dict) and event.get('type') == 'thread.started':
+                observed = str(event.get('thread_id') or '')
+                if observed and (not prior_thread_id or observed == prior_thread_id):
+                    _save_codex_session(router, mapping, observed)
+                break
         stderr_tail = safe_detail(result.stderr.strip()[-4000:], 4000)
         if result.returncode:
             detail = stderr_tail or safe_detail(result.stdout.strip()[-2000:], 2000)
@@ -479,6 +516,7 @@ def _run_codex(router: Router, mapping: Mapping, prompt: str) -> dict[str, Any]:
         _save_codex_session(router, mapping, thread_id)
         _log(
             "codex_succeeded",
+            job_id=job_id,
             session_id=mapping.session_id,
             codex_thread_id=thread_id,
             resumed=bool(prior_thread_id),
@@ -587,6 +625,7 @@ def _dispatch(router: Router, request: dict[str, Any]) -> dict[str, Any]:
     operation = _required(request, "operation")
 
     if operation == "health":
+        from jobs import worker_running
         config = router.config()
         return {
             "backend": config.backend,
@@ -596,10 +635,22 @@ def _dispatch(router: Router, request: dict[str, Any]) -> dict[str, Any]:
             "codex_home_present": config.codex_home.is_dir(),
             "codex_model": config.codex_model,
             "codex_reasoning_effort": config.codex_reasoning_effort,
+            "job_protocol": 1,
+            "worker_running": worker_running(router),
         }
 
     if operation == "codex_preflight":
         return _codex_preflight(router)
+
+    if operation in {"job_submit", "job_status"}:
+        import jobs
+        job_id = _required(request, 'job_id')
+        if operation == 'job_status':
+            return jobs.status(router, job_id)
+        payload = request.get('payload')
+        if not isinstance(payload, dict):
+            raise RouterError('job payload must be an object')
+        return jobs.submit(router, job_id, payload)
 
     if operation == "lookup":
         mapping = router.lookup(_required(request, "session_id"))
@@ -665,11 +716,16 @@ def _dispatch(router: Router, request: dict[str, Any]) -> dict[str, Any]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", help="Path to the shared route configuration")
+    parser.add_argument("--worker", action="store_true", help="Run the supervised durable queue")
     args = parser.parse_args(argv)
     if args.config:
         os.environ[ROUTES_ENV] = str(Path(args.config).expanduser().resolve())
     os.environ[FORCE_LOCAL_ENV] = "1"
     logging.basicConfig(level=logging.INFO, format="%(message)s", stream=sys.stderr)
+    if args.worker:
+        from jobs import worker
+        worker(Router())
+        return 0
 
     raw = sys.stdin.buffer.read(MAX_REQUEST_BYTES + 1)
     request_id = uuid.uuid4().hex[:12]

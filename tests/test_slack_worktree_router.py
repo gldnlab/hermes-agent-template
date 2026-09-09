@@ -8,6 +8,7 @@ import re
 import subprocess
 import sys
 import threading
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -17,6 +18,179 @@ import yaml
 
 
 PLUGIN_DIR = Path(__file__).parents[1] / "plugins" / "slack-worktree-router"
+
+
+@pytest.fixture
+def durable_modules(router_module):
+    sys.modules['router'] = router_module
+    modules = {}
+    for name in ('jobs', 'remote_helper'):
+        spec = importlib.util.spec_from_file_location(name, PLUGIN_DIR / f'{name}.py')
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+        modules[name] = module
+    spec = importlib.util.spec_from_file_location('durable_plugin', PLUGIN_DIR / '__init__.py',
+        submodule_search_locations=[str(PLUGIN_DIR)])
+    plugin = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = plugin
+    spec.loader.exec_module(plugin)
+    return modules['jobs'], modules['remote_helper'], plugin
+
+
+def job_payload(message_id='1788192345.1204', thread_ts='1788192345.1204'):
+    return dict(session_id='session-1', workspace_id='T123', channel_id='C123',
+                user_id='U123', message_id=message_id, thread_ts=thread_ts, prompt='do the work')
+
+
+def job_id(payload):
+    return hashlib.sha256(json.dumps([payload['workspace_id'],payload['channel_id'],
+                                    payload['message_id']]).encode()).hexdigest()
+
+
+def test_durable_queue_deduplicates_and_serializes_threads(configured_router, durable_modules):
+    router, _ = configured_router
+    jobs, _, _ = durable_modules
+    first = job_payload()
+    second = job_payload('1788192346.1')
+    third = job_payload('1788192347.1', '1788192347.1')
+    for payload in (first, first, second, third):
+        jobs.submit(router, job_id(payload), payload)
+    assert jobs.claim(router)['job_id'] == job_id(first)
+    assert jobs.claim(router)['job_id'] == job_id(third)
+    assert jobs.claim(router) is None
+    jobs.finish(router, job_id(first), 'succeeded', {'final':'done'})
+    assert jobs.claim(router)['job_id'] == job_id(second)
+    with pytest.raises(Exception, match='different content'):
+        jobs.submit(router, job_id(first), dict(first, prompt='different'))
+
+
+def test_worker_restart_recovers_saved_completion_without_rerunning(configured_router, durable_modules):
+    router, _ = configured_router
+    jobs, helper, _ = durable_modules
+    mapping = provision(router)
+    payload = job_payload()
+    jid = job_id(payload)
+    jobs.submit(router, jid, payload)
+    jobs.claim(router)
+    events = router.config().state_db.parent / 'job-events'
+    events.mkdir()
+    (events / f'{jid}.jsonl').write_text('\n'.join([
+        json.dumps({'type':'thread.started','thread_id':'recovered-thread'}),
+        json.dumps({'type':'item.completed','item':{'type':'agent_message','text':'Saved result'}}),
+        json.dumps({'type':'turn.completed'}),
+    ]))
+    jobs.recover_interrupted(router)
+    assert jobs.status(router, jid)['result']['final'] == 'Saved result'
+    assert helper._codex_session(router, mapping) == 'recovered-thread'
+    assert jobs.claim(router) is None
+
+
+def test_worker_restart_marks_uncertain_job_without_replay(configured_router, durable_modules):
+    router, _ = configured_router
+    jobs, _, _ = durable_modules
+    payload = job_payload()
+    jid = job_id(payload)
+    jobs.submit(router, jid, payload)
+    jobs.claim(router)
+    jobs.recover_interrupted(router)
+    assert jobs.status(router, jid)['state'] == 'interrupted'
+    assert jobs.claim(router) is None
+
+
+class FakeSlack:
+    def __init__(self):
+        self.messages = []
+        self.lose_ack = False
+        self.fail_update = False
+
+    def auth_test(self):
+        return {'team_id':'T123','user_id':'BOT'}
+
+    def conversations_replies(self, **kwargs):
+        return {'ok':True,'messages':self.messages}
+
+    def chat_postMessage(self, **kwargs):
+        self.messages.append(dict(kwargs, user='BOT', ts='123.456'))
+        if self.lose_ack:
+            self.lose_ack = False
+            raise TimeoutError('Slack accepted the message but the response was lost')
+        return {'ok':True,'ts':'123.456'}
+
+    def chat_update(self, **kwargs):
+        if self.fail_update:
+            raise TimeoutError('Slack temporarily unavailable')
+        self.messages[0].update(kwargs)
+        return {'ok':True,'ts':'123.456'}
+
+
+def test_delivery_restart_recovers_lost_ssh_and_slack_ack(configured_router, durable_modules, monkeypatch):
+    router, _ = configured_router
+    jobs, _, plugin = durable_modules
+    slack = FakeSlack()
+    lost = [True]
+    def remote(config, operation, **kwargs):
+        result = jobs.submit(router, kwargs['job_id'], kwargs['payload'])
+        if lost[0]:
+            lost[0] = False
+            raise TimeoutError('SSH dropped after saving job')
+        return result
+    monkeypatch.setattr(router, '_remote_request', remote)
+    delivery = plugin.Delivery(router, lambda:slack)
+    jid = delivery.enqueue(job_payload())
+    delivery.tick()
+    with delivery.connect() as conn:
+        conn.execute('UPDATE deliveries SET retry_at=0')
+    # Simulate a fresh Hermes process and a lost Slack acknowledgement.
+    slack.lose_ack = True
+    delivery = plugin.Delivery(router, lambda:slack)
+    delivery.tick()
+    with delivery.connect() as conn:
+        conn.execute('UPDATE deliveries SET retry_at=0')
+    delivery = plugin.Delivery(router, lambda:slack)
+    delivery.tick()
+    assert len(slack.messages) == 1
+    with jobs.connect(router) as conn:
+        assert conn.execute('SELECT COUNT(*) FROM atlas_jobs').fetchone()[0] == 1
+    jobs.finish(router, jid, 'succeeded', {'final':'Actual completed answer'})
+    slack.fail_update = True
+    delivery.tick()
+    with delivery.connect() as conn:
+        assert conn.execute('SELECT delivered FROM deliveries').fetchone()[0] == 0
+        conn.execute('UPDATE deliveries SET retry_at=0')
+    slack.fail_update = False
+    delivery = plugin.Delivery(router, lambda:slack)
+    delivery.tick()
+    assert len(slack.messages) == 1
+    assert slack.messages[0]['text'] == 'Actual completed answer'
+    with delivery.connect() as conn:
+        assert conn.execute('SELECT delivered FROM deliveries').fetchone()[0] == 1
+
+
+def test_railway_inbox_uses_profile_volume_not_remote_state_path(
+    configured_router, durable_modules, monkeypatch, tmp_path
+):
+    router, _ = configured_router
+    _, _, plugin = durable_modules
+    config = replace(router.config(), backend='ssh', state_db=Path('/srv/atlas/state/remote.sqlite3'))
+    monkeypatch.setattr(router, 'config', lambda: config)
+    home = tmp_path / 'data' / '.hermes'
+    monkeypatch.setitem(sys.modules, 'hermes_cli', SimpleNamespace())
+    monkeypatch.setitem(sys.modules, 'hermes_cli.config', SimpleNamespace(get_hermes_home=lambda:home))
+    delivery = plugin.Delivery(router)
+    delivery.enqueue(job_payload())
+    assert (home / 'atlas' / 'atlas-delivery.sqlite3').is_file()
+
+
+def test_gateway_registration_starts_delivery_recovery(durable_modules, monkeypatch):
+    _, _, plugin = durable_modules
+    starts = []
+    monkeypatch.setenv('_HERMES_GATEWAY', '1')
+    monkeypatch.setattr(plugin.DELIVERY, 'start', lambda: starts.append(True))
+    ctx = SimpleNamespace(register_hook=lambda *a, **kw:None,
+                          register_system_prompt_section=lambda *a, **kw:None)
+    plugin.register(ctx)
+    assert starts == [True]
 
 
 @pytest.fixture(scope="module")
@@ -557,7 +731,7 @@ def test_codex_preflight_requires_real_workspace_write(
     assert git(repo, "status", "--porcelain") == ""
 
 
-def test_mapped_slack_message_is_dispatched_to_codex_without_hermes_fallback(configured_router):
+def test_mapped_slack_message_is_dispatched_to_codex_without_hermes_fallback(configured_router, monkeypatch):
     router, _ = configured_router
     mapping = provision(router)
     spec = importlib.util.spec_from_file_location(
@@ -605,6 +779,8 @@ def test_mapped_slack_message_is_dispatched_to_codex_without_hermes_fallback(con
 
     adapter = Adapter()
     module.ROUTER = FakeRouter()
+    module.DELIVERY = module.Delivery(module.ROUTER)
+    monkeypatch.setattr(module.DELIVERY, 'start', lambda: None)
     source = SimpleNamespace(
         platform="slack", chat_id="C123", user_id="U123", scope_id="T123", thread_id=None,
     )
@@ -620,10 +796,12 @@ def test_mapped_slack_message_is_dispatched_to_codex_without_hermes_fallback(con
         await asyncio.gather(*list(module._BACKGROUND_TASKS))
 
     asyncio.run(scenario())
-    assert len(adapter.sent) == 1
-    assert "Model: `gpt-6-astra` · reasoning: `medium`" in adapter.sent[0][1]
-    assert adapter.sent[0][1].endswith("Done.")
-    assert all(item[2] == "1788192345.1204" for item in adapter.sent)
+    assert adapter.sent == []
+    with module.DELIVERY.connect() as conn:
+        rows = conn.execute('SELECT * FROM deliveries').fetchall()
+    assert len(rows) == 1
+    assert json.loads(rows[0]['payload'])['prompt'] == 'make the change'
+    assert rows[0]['delivered'] == 0
 
 
 def test_unauthorized_user_in_mapped_channel_is_dropped(configured_router):

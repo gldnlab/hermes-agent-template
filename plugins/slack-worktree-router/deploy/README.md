@@ -8,6 +8,7 @@ Install these plugin files under `/opt/hermes-worktree-router/`:
 - `router.py`
 - `remote_helper.py`
 - `cleanup.py`
+- `jobs.py`
 
 Install `deploy/atlas-pre-push` as
 `/opt/hermes-worktree-router/git-hooks/pre-push`, root-owned and executable.
@@ -47,6 +48,22 @@ worktrees, state, GitHub auth, and Codex home. It is not a sudoer. The route
 file is root-owned, group-readable by `atlas`, and not writable by that account.
 The helper executable and pre-push guard are root-owned and not writable by
 `atlas`.
+
+Install `deploy/atlas-worker.service` under `/etc/systemd/system/`, then run
+`systemctl daemon-reload` and `systemctl enable --now atlas-worker.service`.
+The worker owns execution independently of SSH. Its existing credential file
+is loaded by systemd; no new secret or production environment variable is
+required. Deploy the worker before the Railway plugin. Restart it only when
+idle where possible; uncertain running turns are marked interrupted on startup
+and are not automatically replayed. Queued jobs remain queued. Inspect
+`journalctl -u atlas-worker` and `/srv/atlas/state/helper.jsonl` for job IDs.
+
+The Railway relay starts only when the plugin is enabled in a gateway process.
+Its inbox and delivery receipts live in
+`/data/.hermes/atlas/atlas-delivery.sqlite3` on the persistent volume (resolved
+through the profile's Hermes home, not the remote `state_db` path). The profile's Slack
+configuration supplies its token; named profiles without this plugin are not
+used. Test messages should be explicitly authorized before live Slack checks.
 
 Install `deploy/atlas-worktree-cleanup.service` and
 `deploy/atlas-worktree-cleanup.timer` under `/etc/systemd/system/`, then run:
