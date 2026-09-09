@@ -20,6 +20,17 @@ mkdir -p /data/.hermes/cron /data/.hermes/sessions /data/.hermes/logs \
          /data/.hermes/workspace /data/.hermes/skins /data/.hermes/plans \
          /data/.hermes/home
 
+# Offer the fork's readable dashboard skin through Hermes's native picker.
+# Seed only missing files so a locally customized theme survives redeploys.
+mkdir -p /data/.hermes/dashboard-themes
+for theme_file in /app/dashboard-themes/*.yaml; do
+  [ -f "$theme_file" ] || continue
+  theme_destination="/data/.hermes/dashboard-themes/$(basename "$theme_file")"
+  if [ ! -e "$theme_destination" ]; then
+    cp "$theme_file" "$theme_destination"
+  fi
+done
+
 # Stamp the install method as "docker" so hermes treats this as an immutable
 # container image, not a pip checkout. hermes's detect_install_method() reads
 # $HERMES_HOME/.install_method FIRST (before any .git / pip fallback). Without

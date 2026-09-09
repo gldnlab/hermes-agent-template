@@ -1,0 +1,93 @@
+name: clear
+label: Clear Owners
+description: Plain type, readable labels, and crisp controls on a quiet blue background for Hermes-Owners.
+palette:
+  background: {hex: '#141820', alpha: 1}
+  midground: {hex: '#f1f5f9', alpha: 1}
+  foreground: {hex: '#ffffff', alpha: 0}
+  warmGlow: transparent
+  noiseOpacity: 0
+typography:
+  fontSans: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+  fontDisplay: 'system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif'
+  fontMono: 'ui-monospace, SFMono-Regular, Menlo, Consolas, monospace'
+  baseSize: 16px
+  lineHeight: '1.5'
+  letterSpacing: '0'
+layout:
+  radius: 0.5rem
+  density: comfortable
+layoutVariant: standard
+terminalBackground: '#141820'
+terminalForeground: '#f1f5f9'
+colorOverrides:
+  card: '#1c2330'
+  cardForeground: '#f1f5f9'
+  popover: '#1c2330'
+  popoverForeground: '#f1f5f9'
+  primary: '#93c5fd'
+  primaryForeground: '#141820'
+  secondary: '#293548'
+  secondaryForeground: '#f1f5f9'
+  muted: '#293548'
+  mutedForeground: '#c0cad8'
+  accent: '#293e59'
+  accentForeground: '#f1f5f9'
+  destructive: '#fda4af'
+  destructiveForeground: '#141820'
+  success: '#86efac'
+  warning: '#fde68a'
+  border: '#627188'
+  input: '#627188'
+  ring: '#93c5fd'
+# Loaded and removed by Hermes's native theme picker. These rules also
+# cover Nous components that hard-code decorative fonts instead of using
+# the theme typography tokens. Code and terminal fonts stay monospace.
+customCSS: |
+  :root {
+    color-scheme: dark;
+    --text-primary: #f1f5f9;
+    --text-secondary: #c0cad8;
+    --text-tertiary: #b2bfd0;
+    --text-disabled: #8c9aaf;
+    --font-rules-compressed: var(--theme-font-sans);
+    --font-rules-expanded: var(--theme-font-sans);
+    --font-mondwest: var(--theme-font-sans);
+  }
+  .font-compressed, .font-expanded, .font-mondwest, .font-serif,
+  .font-courier:not(pre):not(code):not(samp):not(kbd),
+  h1, h2, h3, h4, label, legend, input, select, button {
+    font-family: var(--theme-font-sans) !important;
+    letter-spacing: normal !important;
+  }
+  .uppercase { text-transform: none !important; }
+  [class*="tracking-"] { letter-spacing: normal !important; }
+  h1, h2, h3, h4, label, legend { font-weight: 600; }
+  .text-xs { font-size: 0.875rem; line-height: 1.5; }
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]), select, textarea {
+    background-color: #141820;
+    color: #f1f5f9;
+    border-color: #627188;
+    border-radius: 6px;
+    font-size: 1rem;
+    line-height: 1.5;
+  }
+  input:not([type="checkbox"]):not([type="radio"]):not([type="range"]), select {
+    min-height: 42px;
+  }
+  input::placeholder, textarea::placeholder {
+    color: #aebbcf !important;
+    opacity: 1;
+  }
+  button[data-active="true"], a[aria-current="page"] {
+    background-color: #293e59;
+    color: #f1f5f9;
+    box-shadow: inset 3px 0 #93c5fd;
+  }
+  /* Important base-layer rules outrank the DS's important utilities. */
+  @layer base {
+    :is(button, a, input, select, textarea, [tabindex]):focus-visible {
+      outline: 2px solid #93c5fd !important;
+      outline-offset: 3px !important;
+    }
+  }

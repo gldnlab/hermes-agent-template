@@ -128,6 +128,7 @@ RUN mkdir -p /data/.hermes
 
 COPY server.py /app/server.py
 COPY templates/ /app/templates/
+COPY dashboard-themes/ /app/dashboard-themes/
 COPY start.sh /app/start.sh
 # Ship the Slack thread -> Git worktree router with the image. Hermes discovers
 # bundled general plugins automatically, but still requires an operator to add
