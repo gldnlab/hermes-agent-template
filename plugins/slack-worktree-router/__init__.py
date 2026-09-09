@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import logging
 import os
+import sys
 import re
 import uuid
 from typing import Any
@@ -243,5 +244,7 @@ def register(ctx) -> None:
         "slack-worktree-router.workspace", _system_prompt,
         position="after_memory", max_chars=2400,
     )
-    if os.environ.get('_HERMES_GATEWAY') == '1':
+    # CLI plugin discovery can precede gateway.run's environment marker.
+    # The dashboard also discovers plugins: it must not own delivery.
+    if os.environ.get('_HERMES_GATEWAY') == '1' or 'gateway' in sys.argv[1:]:
         DELIVERY.start()

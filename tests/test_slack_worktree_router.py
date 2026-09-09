@@ -193,6 +193,21 @@ def test_gateway_registration_starts_delivery_recovery(durable_modules, monkeypa
     assert starts == [True]
 
 
+def test_early_cli_discovery_starts_recovery_but_dashboard_does_not(durable_modules, monkeypatch):
+    _, _, plugin = durable_modules
+    starts = []
+    monkeypatch.delenv('_HERMES_GATEWAY', raising=False)
+    monkeypatch.setattr(plugin.DELIVERY, 'start', lambda: starts.append(True))
+    ctx = SimpleNamespace(register_hook=lambda *a, **kw:None,
+                          register_system_prompt_section=lambda *a, **kw:None)
+    monkeypatch.setattr(sys, 'argv', ['hermes', 'dashboard'])
+    plugin.register(ctx)
+    assert starts == []
+    monkeypatch.setattr(sys, 'argv', ['hermes', 'gateway', 'run', '--external-supervisor'])
+    plugin.register(ctx)
+    assert starts == [True]
+
+
 @pytest.fixture(scope="module")
 def router_module():
     spec = importlib.util.spec_from_file_location("slack_worktree_router_router", PLUGIN_DIR / "router.py")
