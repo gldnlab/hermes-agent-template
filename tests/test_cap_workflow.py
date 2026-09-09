@@ -67,3 +67,15 @@ def test_callback_carries_task_identity_but_no_secrets():
     assert 'ADMIN_PASSWORD' not in result
     with pytest.raises(RuntimeError):
         workflow.add_callback_context('unexpected upstream format')
+
+
+def test_worktree_exclusion_preserves_existing_entries_and_is_idempotent(tmp_path):
+    info = tmp_path / 'repos/vw-site/.git/info'
+    info.mkdir(parents=True)
+    target = info / 'exclude'
+    target.write_text('# operator entries\nprivate-notes')
+    workflow.ensure_repo_exclusions(tmp_path)
+    once = target.read_text()
+    assert once == '# operator entries\nprivate-notes\n/.worktrees/\n'
+    workflow.ensure_repo_exclusions(tmp_path)
+    assert target.read_text() == once

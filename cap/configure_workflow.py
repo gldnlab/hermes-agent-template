@@ -50,10 +50,27 @@ def run(*args):
     return result.stdout.strip()
 
 
+def ensure_repo_exclusions(root):
+    # Native Hermes creates task worktrees below the primary checkout. Keep
+    # those host-local directories out of git status without editing .gitignore.
+    for repo in REPOS:
+        git_dir = root / 'repos' / repo / '.git'
+        if not git_dir.is_dir():
+            continue
+        target = git_dir / 'info' / 'exclude'
+        target.parent.mkdir(exist_ok=True)
+        previous = target.read_text() if target.exists() else ''
+        if '/.worktrees/' not in previous.splitlines():
+            with target.open('a') as f:
+                f.write(('\n' if previous and not previous.endswith('\n') else '')
+                        + '/.worktrees/\n')
+
+
 def main():
     if os.environ.get('RAILWAY_SERVICE_NAME') != 'Hermes-Cap':
         raise RuntimeError('Workflow setup is restricted to Hermes-Cap')
     root = Path('/data/cap')
+    ensure_repo_exclusions(root)
     marker = root / '.native-workflow-v1'
     if marker.exists():
         print(json.dumps({'event': 'cap_workflow_setup', 'status': 'already_configured'}))
@@ -81,6 +98,8 @@ def main():
             kb.create_board(repo, name=repo, description=f'gldnlab/{repo} — Cap coding tasks',
                             default_workdir=str(target))
         print(json.dumps({'event': 'cap_repository_ready', 'repo': repo}))
+
+    ensure_repo_exclusions(root)
 
     config_path = Path('/data/.hermes/config.yaml')
     original = config_path.read_text()
