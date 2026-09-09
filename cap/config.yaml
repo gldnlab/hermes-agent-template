@@ -1,0 +1,18 @@
+model:
+  provider: openai-codex
+  default: gpt-6-astra
+  openai_runtime: codex_app_server
+agent:
+  max_turns: 60
+terminal:
+  backend: local
+  cwd: /data/cap/workspace
+plugins:
+  enabled: []
+kanban:
+  dispatch_in_gateway: false
+  default_workdir: /data/cap/workspace
+approvals:
+  mode: manual
+display:
+  show_commentary: true

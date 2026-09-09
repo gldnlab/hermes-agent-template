@@ -1,6 +1,9 @@
 #!/bin/bash
 set -e
 
+# This dedicated branch is deployed only to the new Hermes-Cap service.
+python3 /app/cap/bootstrap.py
+
 # Mirror dashboard-ref-only's startup: create every directory hermes expects
 # and seed a default config.yaml if the volume is empty. Without these,
 # `hermes dashboard` endpoints that hit logs/, sessions/, cron/, etc. can fail
