@@ -1,0 +1,4 @@
+# Approved for Hermes-Cap's dedicated Railway container only.
+# Worktrees organize tasks; they are not OS security boundaries.
+sandbox_mode = "danger-full-access"
+approval_policy = "on-request"

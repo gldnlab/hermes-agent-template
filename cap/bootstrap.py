@@ -20,6 +20,17 @@ def seed(root: Path, templates: Path, *, service: str) -> dict:
             created.append(name)
         except FileExistsError:
             pass
+    # Seed the user-approved container-boundary policy without replacing any
+    # operator-managed Codex settings or touching authentication. CODEX_HOME
+    # must point to /data/.codex in this service's Railway variables.
+    codex_config = root / '.codex' / 'config.toml'
+    try:
+        with codex_config.open('x') as destination:
+            destination.write((templates / 'codex-config.toml').read_text())
+        codex_config.chmod(0o600)
+        created.append('.codex/config.toml')
+    except FileExistsError:
+        pass
     return {'event': 'cap_bootstrap', 'created': created,
             'worker_dispatch_enabled_by_bootstrap': False}
 
