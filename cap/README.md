@@ -66,3 +66,38 @@ broker. No code here automatically merges PRs or enables GitHub auto-merge.
 
 Until those gates pass, existing Atlas threads continue through their existing
 workflow. No DO resources or old worktrees are removed by this pilot.
+# Mandatory Slack → native Kanban routing
+
+`routing.py` is installed as `gateway/cap_routing.py`. `patch_routing.py` wires it
+into native gateway ingress and worker launch, with build-time anchor checks.
+It applies only to Hermes-Cap and the four channels in `ROUTES`; normal DMs and
+the Team/Owners services are unaffected. No optional plugin toggle can silently
+disable this path. A failed import prevents dispatch rather than falling back
+to an unregistered coding conversation.
+
+The native board DB stores `cap_threads` (thread → task/path/branch/base SHA)
+and `cap_messages` (durable request, dedup key and acknowledgement outbox).
+Creation uses a per-board process lock and an atomic native operator-block
+event; a bare `blocked` status is insufficient because Hermes recomputes it.
+The router fetches origin/main and records its SHA without altering the primary
+checkout, provisions a persistent worktree, subscribes Slack, then unblocks.
+Worker launch verifies the mapped repository, branch and path. Native Hermes
+retains ownership of claims, execution, retries, review and result delivery.
+
+Mid-run follow-ups conservatively schedule another native turn after Review.
+They are not live interrupts: changes already underway can finish first.
+Duplicate inbound message IDs cannot create duplicate tasks or comments.
+Acknowledgements are at-least-once across a Slack-send/DB-commit crash window;
+result delivery remains the native notifier's responsibility. Neither worktrees
+nor this routing layer restrict shell access outside the mapped repository.
+
+Diagnostics: filter Hermes-Cap logs for `cap_request_saved`, `cap_task_ready`,
+`cap_followup_ready`, `cap_route_failed`, `cap_ingress_failed` or
+`cap_ack_delivery_failed`. Preparation failures remain blocked and expose the
+same error ID in Slack and logs; failed delivery remains in the outbox. A
+worker-blocked task requires `retry` after repair. Do not blindly reset tasks or
+delete their branches/worktrees to recover. Closed tasks require a new thread.
+
+`routing_smoke.py` exercises the installed native APIs in isolated temporary
+boards and local Git fixtures; it sends no Slack messages and runs no model.
+`import_pr15.py` is an explicit one-time operator migration, not a startup job.

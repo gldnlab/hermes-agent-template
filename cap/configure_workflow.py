@@ -71,6 +71,11 @@ def main():
         raise RuntimeError('Workflow setup is restricted to Hermes-Cap')
     root = Path('/data/cap')
     ensure_repo_exclusions(root)
+    guide = Path('/app/cap/routing-guide.md')
+    soul = Path('/data/.hermes/SOUL.md')
+    if guide.exists() and soul.exists() and "## Cap's enforced Slack routing (v1)" not in soul.read_text():
+        with soul.open('a') as stream:
+            stream.write('\n' + guide.read_text())
     marker = root / '.native-workflow-v1'
     if marker.exists():
         print(json.dumps({'event': 'cap_workflow_setup', 'status': 'already_configured'}))

@@ -132,9 +132,11 @@ COPY dashboard-themes/ /app/dashboard-themes/
 COPY start.sh /app/start.sh
 COPY cap/ /app/cap/
 COPY cap/runtime_policy.py /opt/hermes-agent/agent/cap_runtime_policy.py
+COPY cap/routing.py /opt/hermes-agent/gateway/cap_routing.py
 RUN apt-get update && apt-get install -y --no-install-recommends gh && \
     rm -rf /var/lib/apt/lists/* && \
-    python3 /app/cap/runtime_policy.py
+    python3 /app/cap/runtime_policy.py && \
+    python3 /app/cap/patch_routing.py
 # Cap branch only: pin the actual Codex CLI, not an OpenAI model adapter.
 RUN npm install --global --ignore-scripts --no-audit --no-fund @openai/codex@0.153.4 && \
     codex --version
