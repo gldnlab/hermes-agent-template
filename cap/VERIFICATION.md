@@ -1,5 +1,31 @@
 # Verified native Cap workflow
 
+## Slack feedback rollout — permission still required
+
+Implementation `98b840b`, Cap deployment
+`5abdf442-dd72-4762-bfc9-bc502d93f2b2` (successful).
+
+- 81 local tests pass. Installed-Hermes smoke checks passed for per-message run
+  binding, queued follow-ups, full event-specific run summaries and native patch
+  compatibility. Normal DMs and other services retain native reaction hooks.
+- Only a thread's first accepted request gets the board/task introduction;
+  follow-ups have an empty acknowledgement body. Errors remain visible.
+- Native notification replay for vw-dashboards task `t_b63a971b`, review event
+  12/run 2, delivered the full 1,547-character answer in Slack message
+  `1789018133.481629`. Slack API read-back confirmed both the caveat and final
+  verification note. The task stayed in Review; no coding rerun was started.
+- Live reaction verification is BLOCKED: Slack returned `missing_scope`, needed
+  `reactions:write`. Cap app `A0C0FNJELBY` currently has `reactions:read` but lacks
+  write permission. Reactions are enabled in config. The deployed watcher logs
+  the permission failure and retains retries with backoff; coding/result delivery
+  continue independently. Do not report live reactions as verified until the
+  operator adds the bot scope and reauthorizes/reinstalls Cap.
+- A clearly labeled no-coding reaction-test message was posted in Derek's Cap
+  DM; its identity is saved in `/data/cap/feedback-verification-98b840b.json`.
+  The first reaction API attempt failed before any status changes succeeded.
+- Team/Owners deployment IDs are unchanged. No production env vars, tokens or
+  Slack app permissions were changed during this rollout.
+
 ## Enforced routing rollout
 
 Implementation: `e5abe92`, deployed only to Hermes-Cap as
