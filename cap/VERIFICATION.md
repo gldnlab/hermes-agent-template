@@ -1,6 +1,43 @@
 # Verified native Cap workflow
 
-## Google Sheets setup — key encoding correction pending approval
+## Google Sheets reader account rollout
+
+The operator supplied a fresh JSON credential for the intended dashboard-reader
+account and authorized replacing Cap's two Google variables. The JSON was parsed
+directly (no manual escaping), its PEM validated, and spreadsheet access tested
+successfully before replacing the variables. Secret values were transferred via
+stdin, never stored in this repository or printed in tool output.
+
+Deployment `ac581b1a-bc25-4892-b173-69e7564a7d2e` succeeded. On the running Cap
+container, authenticated metadata and a five-column header read both passed;
+the credential file is 0600. No Google sharing or client source data was changed.
+Vee and the other Hermes services were left unchanged.
+
+A real ephemeral Codex CLI run (gpt-6-astra, medium) then invoked the installed
+helper through its command tool. It returned `ok: true`, command exit 0, and all
+five requested headers. The test created no tasks, PRs, source edits or Slack
+messages. It verifies authenticated source reading from the coding runtime,
+not just a direct operator SSH request.
+
+## Earlier key correction — wrong service-account identity (historical)
+
+Derek explicitly approved correcting `GOOGLE_SERVICE_API_KEY`. Only that Cap
+variable was replaced with the decoded original key. The stored PEM passed
+OpenSSL validation. Deployment `5db03a78-bd14-40a3-be81-3fd00280c792` succeeded.
+The credentials file is 0600; the disabled marker is gone; the guide is installed.
+
+An authenticated metadata GET returned HTTP 403, `PERMISSION_DENIED`,
+`The caller does not have permission`. The original copied account was not the
+intended dashboard reader. No sharing or source-sheet data was changed to work
+around that mismatch; the operator subsequently supplied the correct account.
+
+A live ephemeral Codex CLI run (gpt-6-astra, medium) invoked the installed helper
+through its command tool and correctly reported `ok: false`, command exit 1,
+and error ID `75b1773eeabf`. This verifies helper availability in the coding
+runtime and error reporting, not successful spreadsheet access. No task, PR,
+source edit, or Slack message was created by that smoke test.
+
+## Google Sheets initial rollout and recovery (historical)
 
 Helper implementation `73ab706`, startup recovery `ea256d1`; current successful
 Cap deployment `bbe0902c-f1fa-4924-904f-b6f101095f17`. 99 targeted tests pass.
