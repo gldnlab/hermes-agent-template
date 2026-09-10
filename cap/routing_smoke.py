@@ -4,6 +4,8 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import inspect
+import sys
 
 
 def main():
@@ -71,11 +73,25 @@ def main():
     patch_spec = importlib.util.spec_from_file_location('patch', Path(__file__).with_name('patch_routing.py'))
     patch = importlib.util.module_from_spec(patch_spec)
     patch_spec.loader.exec_module(patch)
+    # Real native PR guard, patched in THIS isolated test process only.
+    sys.modules['gateway.cap_routing'] = mod
+    guard_source = inspect.getsource(kb.check_respawn_guard)
+    if 'from gateway.cap_routing import explicit_request' not in guard_source:
+        exec(compile(patch.patch_duplicate_guard(guard_source), '<guard>', 'exec'), kb.__dict__)
+    with router.connect('vw-site') as conn:
+        kb.add_comment(conn, task.id, 'test', 'Existing PR https://github.com/gldnlab/vw-site/pull/15')
+        assert kb.check_respawn_guard(conn, task.id) is None
+        os.environ['RAILWAY_SERVICE_NAME'] = 'Hermes-Team'
+        assert kb.check_respawn_guard(conn, task.id) == 'active_pr'
+        os.environ['RAILWAY_SERVICE_NAME'] = 'Hermes-Cap'
+        with conn:
+            conn.execute('UPDATE tasks SET last_failure_error=? WHERE id=?', ('unauthorized', task.id))
+        assert kb.check_respawn_guard(conn, task.id) == 'blocker_auth'
     for name, fn in [('gateway/run.py', patch.patch_gateway), ('hermes_cli/kanban_db.py', patch.patch_kanban)]:
         source = (Path('/opt/hermes-agent') / name).read_text()
         if 'from gateway.cap_routing import' not in source:
             compile(fn(source), name, 'exec')
-    print('PASS: native create/dedup, Git worktree, correct boards, Slack subscription, review/follow-up, patch compatibility')
+    print('PASS: native create/dedup, provisioning hold, Git worktree, boards, subscription, follow-up, PR guard scope, auth guard, patches')
 
 
 if __name__ == '__main__':

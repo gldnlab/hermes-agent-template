@@ -267,6 +267,16 @@ def worker_prompt(task, workspace, board):
                 + latest)
 
 
+def explicit_request(conn, task_id):
+    """Registered requests may refine an existing PR; don't treat them as duplicates."""
+    if os.environ.get('RAILWAY_SERVICE_NAME') != 'Hermes-Cap':
+        return False
+    if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='cap_threads'").fetchone():
+        return False
+    return bool(conn.execute("SELECT 1 FROM cap_threads t WHERE t.task_id=? AND t.state='active' "
+        'AND EXISTS(SELECT 1 FROM cap_messages m WHERE m.route_key=t.route_key)', (task_id,)).fetchone())
+
+
 async def send(gateway, channel, thread, text):
     for platform, adapter in gateway.adapters.items():
         if str(getattr(platform, 'value', platform)) == 'slack':

@@ -189,6 +189,20 @@ def test_native_patch_fails_on_drift_and_contains_no_alternative_runner():
         patch.patch_gateway(changed)
     with pytest.raises(RuntimeError):
         patch.patch_gateway('changed upstream')
-    worker = patch.patch_kanban('def test():\n    prompt = f"work kanban task {task.id}"\n')
+    worker = patch.patch_kanban('def test():\n    prompt = f"work kanban task {task.id}"\n'
+        '    # 3. Completed run within guard window — proof of recent success.\n')
     assert 'worker_prompt(task, workspace, board)' in worker
     compile(worker, '<fixture>', 'exec')
+
+
+def test_only_explicit_registered_requests_bypass_duplicate_pr_guard(router, monkeypatch):
+    enqueue(router)
+    monkeypatch.setenv('RAILWAY_SERVICE_NAME', 'Hermes-Cap')
+    with router.connect('vw-site') as conn, conn:
+        task = conn.execute('SELECT task_id FROM cap_threads').fetchone()[0]
+        assert not routing.explicit_request(conn, task)
+        conn.execute("UPDATE cap_threads SET state='active'")
+        assert routing.explicit_request(conn, task)
+        assert not routing.explicit_request(conn, 'unknown')
+        monkeypatch.setenv('RAILWAY_SERVICE_NAME', 'Hermes-Team')
+        assert not routing.explicit_request(conn, task)

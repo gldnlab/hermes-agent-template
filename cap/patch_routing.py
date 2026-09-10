@@ -30,11 +30,26 @@ def patch_gateway(source):
 
 def patch_kanban(source):
     anchor = '    prompt = f"work kanban task {task.id}"'
-    return replace_once(source, anchor, anchor + '''
+    result = replace_once(source, anchor, anchor + '''
     if os.environ.get("RAILWAY_SERVICE_NAME") == "Hermes-Cap":
         from gateway.cap_routing import worker_prompt
         prompt += worker_prompt(task, workspace, board)
 ''')
+    return patch_duplicate_guard(result)
+
+
+def patch_duplicate_guard(result):
+    guard = '    # 3. Completed run within guard window — proof of recent success.'
+    if result.count(guard) != 1:
+        raise RuntimeError('Hermes respawn guard changed')
+    return result.replace(guard, '''    # Cap's durable request is an intentional continuation, including PR refinements.
+    # This runs AFTER native rate-limit and authentication guards, never around them.
+    if os.environ.get("RAILWAY_SERVICE_NAME") == "Hermes-Cap":
+        from gateway.cap_routing import explicit_request
+        if explicit_request(conn, task_id):
+            return None
+
+''' + guard)
 
 
 if __name__ == '__main__':
