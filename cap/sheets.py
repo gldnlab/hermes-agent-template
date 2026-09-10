@@ -10,6 +10,7 @@ from urllib.parse import quote, urlparse
 import uuid
 
 CREDENTIALS = Path('/data/cap/credentials/google-sheets.json')
+DISABLED = Path('/data/cap/credentials/google-sheets.disabled')
 SCOPE = 'https://www.googleapis.com/auth/spreadsheets.readonly'
 API = 'https://sheets.googleapis.com/v4/spreadsheets/'
 
@@ -69,6 +70,29 @@ def spreadsheet_id(value):
     return value
 
 
+def setup(env=None, target=CREDENTIALS, disabled=DISABLED):
+    """A broken optional integration must not stop Slack or coding startup."""
+    env = os.environ if env is None else env
+    if env.get('RAILWAY_SERVICE_NAME') != 'Hermes-Cap':
+        return
+    disabled = Path(disabled)
+    try:
+        if not env.get('GOOGLE_SERVICE_ACCOUNT_EMAIL') or not env.get('GOOGLE_SERVICE_API_KEY'):
+            raise SheetsError('Google Sheets credentials are missing.')
+        provision(env, target)
+    except Exception as exc:
+        error_id = uuid.uuid4().hex[:12]
+        disabled.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        disabled.write_text(error_id)
+        print(json.dumps({'event': 'cap_sheets_setup_failed', 'error_id': error_id,
+                          'error_type': type(exc).__name__}), file=sys.stderr)
+        return False
+    if disabled.exists():
+        disabled.unlink()
+    print(json.dumps({'event': 'cap_sheets_setup', 'status': 'configured'}))
+    return True
+
+
 def read(sheet, a1=None, render='FORMATTED_VALUE', session=None):
     ident = spreadsheet_id(sheet)
     if render not in ('FORMATTED_VALUE', 'UNFORMATTED_VALUE', 'FORMULA'):
@@ -77,6 +101,8 @@ def read(sheet, a1=None, render='FORMATTED_VALUE', session=None):
     try:
         if owned:
             from google.auth.transport.requests import AuthorizedSession
+            if DISABLED.exists():
+                raise SheetsError('Cap Google Sheets setup failed; ask the operator to check cap_sheets_setup_failed in startup logs.')
             if not CREDENTIALS.is_file():
                 raise SheetsError('Cap Google Sheets connection is missing; ask the operator to configure it.')
             session = AuthorizedSession(credentials(json.loads(CREDENTIALS.read_text())),

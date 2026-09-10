@@ -114,3 +114,18 @@ def test_read_only_scope_and_no_delegation(monkeypatch):
     monkeypatch.setitem(sys.modules, 'google.oauth2.service_account', service)
     sheets.credentials({})
     assert seen == {'scopes': ['https://www.googleapis.com/auth/spreadsheets.readonly']}
+
+
+def test_setup_failure_blocks_sheets_not_gateway(tmp_path, monkeypatch, capsys):
+    disabled = tmp_path / 'google-sheets.disabled'
+    env = {'RAILWAY_SERVICE_NAME': 'Hermes-Cap', 'GOOGLE_SERVICE_ACCOUNT_EMAIL': 'test',
+           'GOOGLE_SERVICE_API_KEY': 'secret'}
+    def fail(*args):
+        raise RuntimeError('SECRET KEY')
+    monkeypatch.setattr(sheets, 'provision', fail)
+    assert sheets.setup(env, tmp_path / 'key.json', disabled) is False
+    assert disabled.exists()
+    assert 'SECRET KEY' not in capsys.readouterr().err
+    monkeypatch.setattr(sheets, 'provision', lambda *a: None)
+    assert sheets.setup(env, tmp_path / 'key.json', disabled) is True
+    assert not disabled.exists()

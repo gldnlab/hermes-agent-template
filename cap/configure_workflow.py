@@ -70,8 +70,8 @@ def main():
     if os.environ.get('RAILWAY_SERVICE_NAME') != 'Hermes-Cap':
         raise RuntimeError('Workflow setup is restricted to Hermes-Cap')
     root = Path('/data/cap')
-    from sheets import provision
-    provision()
+    from sheets import setup
+    setup()
     sheets_guide = Path('/app/cap/sheets-guide.md')
     sheets_soul = Path('/data/.hermes/SOUL.md')
     if sheets_guide.exists() and sheets_soul.exists() and "## Cap's authenticated Google Sheets access (v1)" not in sheets_soul.read_text():
