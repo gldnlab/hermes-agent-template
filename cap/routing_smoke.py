@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import inspect
 import sys
+from types import SimpleNamespace
 
 
 def main():
@@ -52,17 +53,34 @@ def main():
         assert task.status == 'ready', task.status
         assert len(kb.list_comments(conn, task.id)) == 1
         assert len(kb.list_notify_subs(conn)) == 1
+        task = kb.claim_task(conn, task.id)
+        assert task and task.current_run_id
     # Uses real Git branch/common-dir validation and native API state transitions.
     assert 'No-op fixture' in mod.worker_prompt(task, row['path'], 'vw-site')
     router.enqueue(channel, ts, '1788976795.031949', 'U013H8QQBGT', 'Follow-up fixture')
     with router.connect('vw-site') as conn:
         assert kb.request_review(conn, task.id, summary='Fixture ready for review', force=True)
+        first_run = task.current_run_id
+        assert conn.execute('SELECT run_id FROM cap_feedback WHERE seq=1').fetchone()[0] == first_run
+        assert conn.execute('SELECT run_id FROM cap_feedback WHERE seq=2').fetchone()[0] is None
     router.reconcile('vw-site')
     with router.connect('vw-site') as conn:
         task = kb.get_task(conn, task.id)
         assert task.status == 'ready', task.status
         assert conn.execute('SELECT COUNT(*) FROM tasks').fetchone()[0] == 1
+        task = kb.claim_task(conn, task.id)
     assert 'Follow-up fixture' in mod.worker_prompt(task, row['path'], 'vw-site')
+    with router.connect('vw-site') as conn:
+        full = 'Complete answer\n' + 'Detailed finding. ' * 400 + '\nhttps://preview.example.test/\nFinal caveat'
+        assert kb.request_review(conn, task.id, summary=full, force=True)
+        event = [e for e in kb.list_events(conn, task.id) if e.kind == 'review_requested'][-1]
+        assert conn.execute('SELECT run_id FROM cap_feedback WHERE seq=1').fetchone()[0] == first_run
+        assert conn.execute('SELECT run_id FROM cap_feedback WHERE seq=2').fetchone()[0] == task.current_run_id
+    sub = dict(platform='slack', task_id=task.id, chat_id=channel, thread_id=ts)
+    assert full in mod.full_notification('vw-site', sub, event, 'truncated')
+    # Return the task to ready for the native duplicate-PR guard checks below.
+    with router.connect('vw-site') as conn:
+        kb.reopen_review_task(conn, task.id)
     router.enqueue('C0BUTAUA88M', ts, ts, 'U013H8QQBGT', 'Other repository')
     router.reconcile('vw-hq')
     with router.connect('vw-hq') as conn:
@@ -91,6 +109,12 @@ def main():
         source = (Path('/opt/hermes-agent') / name).read_text()
         if 'from gateway.cap_routing import' not in source:
             compile(fn(source), name, 'exec')
+    for name, fn in [('plugins/platforms/slack/adapter.py', patch.patch_slack_feedback),
+                     ('gateway/kanban_watchers.py', patch.patch_notifier)]:
+        source = (Path('/opt/hermes-agent') / name).read_text()
+        if 'from gateway.cap_routing import' not in source:
+            compile(fn(source), name, 'exec')
+    print('PASS: per-message native run binding, queued follow-up, full result including final caveat, Slack hook/notifier patches')
     print('PASS: native create/dedup, provisioning hold, Git worktree, boards, subscription, follow-up, PR guard scope, auth guard, patches')
 
 

@@ -52,8 +52,39 @@ def patch_duplicate_guard(result):
 ''' + guard)
 
 
+def patch_slack_feedback(source):
+    if 'from gateway.cap_routing import owns_event' in source:
+        raise RuntimeError('Hermes Slack feedback already patched')
+    for anchor in [
+        '        """Add an in-progress reaction when message processing begins."""',
+        '        """Swap the in-progress reaction for a final success/failure reaction."""',
+    ]:
+        if source.count(anchor) != 1:
+            raise RuntimeError('Hermes Slack processing hook changed')
+        source = source.replace(anchor, anchor + '''
+        from gateway.cap_routing import owns_event
+        if owns_event(event):
+            if event.message_id:
+                self._reacting_message_ids.discard(
+                    self._workspace_message_marker(str(event.source.scope_id or ""), event.message_id))
+            return  # The durable worker lifecycle owns Cap's reactions.
+''')
+    return source
+
+
+def patch_notifier(source):
+    anchor = '                            _send_res = await adapter.send('
+    if source.count(anchor) != 1 or 'full_notification' in source:
+        raise RuntimeError('Hermes notification delivery changed')
+    return source.replace(anchor, '''                            from gateway.cap_routing import full_notification
+                            msg = full_notification(board_slug, sub, ev, msg)
+''' + anchor)
+
+
 if __name__ == '__main__':
-    for name, patch in [('gateway/run.py', patch_gateway), ('hermes_cli/kanban_db.py', patch_kanban)]:
+    for name, patch in [('gateway/run.py', patch_gateway), ('hermes_cli/kanban_db.py', patch_kanban),
+                        ('plugins/platforms/slack/adapter.py', patch_slack_feedback),
+                        ('gateway/kanban_watchers.py', patch_notifier)]:
         target = Path('/opt/hermes-agent') / name
         result = patch(target.read_text())
         compile(result, str(target), 'exec')

@@ -34,7 +34,9 @@ class KB:
         conn.executescript('''CREATE TABLE IF NOT EXISTS tasks (
             id TEXT PRIMARY KEY, status TEXT, current_run_id TEXT, path TEXT, branch TEXT, idem TEXT);
             CREATE TABLE IF NOT EXISTS comments(task TEXT, body TEXT);
-            CREATE TABLE IF NOT EXISTS subs(task TEXT UNIQUE);''')
+            CREATE TABLE IF NOT EXISTS subs(task TEXT UNIQUE);
+            CREATE TABLE IF NOT EXISTS task_runs(id INTEGER PRIMARY KEY, task_id TEXT,
+                summary TEXT, outcome TEXT, ended_at INTEGER);''')
         return conn
 
     @contextmanager

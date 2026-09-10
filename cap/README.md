@@ -68,6 +68,19 @@ Until those gates pass, existing Atlas threads continue through their existing
 workflow. No DO resources or old worktrees are removed by this pilot.
 # Mandatory Slack → native Kanban routing
 
+Slack feedback: one board/task introduction per thread, then no repeated saved
+messages. Reactions on each accepted request follow its own native run:
+hourglass while queued, eyes while running, check mark when the answer is ready,
+and X for a blocker/failure. Follow-ups waiting behind a running request remain
+queued. Native short-handoff reactions are suppressed only for Cap's routed
+events, including unmentioned thread replies. DMs retain normal Hermes behavior.
+Reaction delivery state/retries live in `cap_feedback`; failures are logged with
+an error ID and sanitized Slack error code and never prevent coding. The feedback
+watcher runs independently of repository fetch/provisioning. Review/completion
+notifications use the full summary from that specific run, delivered by the
+existing native notifier with its retry/cursor behavior. No new model handles
+notifications, and no token/env-var changes are required.
+
 `routing.py` is installed as `gateway/cap_routing.py`. `patch_routing.py` wires it
 into native gateway ingress and worker launch, with build-time anchor checks.
 It applies only to Hermes-Cap and the four channels in `ROUTES`; normal DMs and

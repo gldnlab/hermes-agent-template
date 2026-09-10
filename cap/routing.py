@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import time
 import uuid
 
 WORKSPACE = 'TLREWAM8X'
@@ -55,6 +56,9 @@ def schema(conn):
         user_id TEXT NOT NULL, text TEXT NOT NULL, ack TEXT NOT NULL,
         delivered INTEGER NOT NULL DEFAULT 0,
         UNIQUE(route_key, message_id));
+      CREATE TABLE IF NOT EXISTS cap_feedback (
+        seq INTEGER PRIMARY KEY, run_id INTEGER, reaction TEXT,
+        next_attempt REAL NOT NULL DEFAULT 0, failures INTEGER NOT NULL DEFAULT 0);
     ''')
 
 
@@ -135,17 +139,17 @@ class Router:
                 attachments.append(str(dest))
             content = json.dumps({'slack_message': message, 'user': user, 'request': text,
                                   'context': context, 'attachments': attachments}, ensure_ascii=False)
-            ack = (f'Saved to *{board}* · `{task.id}`. '
-                   + ('Your follow-up will run after the current turn.' if task.status == 'running'
-                      else ('This task is blocked. Say “retry” after fixing the blocker.'
-                            if task.status == 'blocked' and mapping['state'] == 'active'
-                            else 'Cap will use this thread’s task and branch.'))
-                   + '\nBoard: https://hermes-cap-production.up.railway.app/kanban')
+            first = not conn.execute('SELECT 1 FROM cap_messages WHERE route_key=? LIMIT 1', (key,)).fetchone()
+            ack = (f'Tracking this thread in *{board}* · `{task.id}`.\n'
+                   'https://hermes-cap-production.up.railway.app/kanban') if first else ''
             # Comment + inbound dedup marker commit together, or neither does.
             with self.kb.write_txn(conn):
                 self.kb.add_comment(conn, task.id, 'slack:' + user, content)
                 conn.execute('INSERT INTO cap_messages(route_key,message_id,user_id,text,ack) '
                              'VALUES(?,?,?,?,?)', (key, message, user, content, ack))
+                seq = conn.execute('SELECT seq FROM cap_messages WHERE route_key=? AND message_id=?',
+                                   (key, message)).fetchone()[0]
+                conn.execute('INSERT INTO cap_feedback(seq) VALUES(?)', (seq,))
             self.kb.add_notify_sub(conn, task_id=task.id, platform='slack', chat_id=channel,
                 thread_id=thread, user_id=user, chat_type='group', notifier_profile='default',
                 delivery_mode='notify', delivery_metadata={'slack_team_id': WORKSPACE})
@@ -258,6 +262,13 @@ def worker_prompt(task, workspace, board):
         with conn:
             conn.execute('UPDATE cap_threads SET consumed=? WHERE route_key=?',
                          (messages[-1]['seq'], row['route_key']))
+            # Bind each accepted message to the actual native run. Failed runs
+            # can be retried; successful earlier messages must stay completed.
+            conn.execute('UPDATE cap_feedback SET run_id=?, next_attempt=0 WHERE seq IN '
+                '(SELECT seq FROM cap_messages WHERE route_key=? AND seq<=?) AND '
+                '(run_id IS NULL OR run_id IN (SELECT id FROM task_runs WHERE '
+                "outcome IS NULL OR outcome NOT IN ('review_requested','completed')))",
+                (task.current_run_id, row['route_key'], messages[-1]['seq']))
         latest = messages[-1]['text']
         return ('\n\nThis is a routed Slack task. Read kanban_show and its comments for full history. '
                 'Respond to the latest request below; do not repeat completed work. '
@@ -275,6 +286,117 @@ def explicit_request(conn, task_id):
         return False
     return bool(conn.execute("SELECT 1 FROM cap_threads t WHERE t.task_id=? AND t.state='active' "
         'AND EXISTS(SELECT 1 FROM cap_messages m WHERE m.route_key=t.route_key)', (task_id,)).fetchone())
+
+
+def owns_event(event):
+    source = getattr(event, 'source', None)
+    return (os.environ.get('RAILWAY_SERVICE_NAME') == 'Hermes-Cap'
+            and getattr(source, 'scope_id', None) == WORKSPACE
+            and getattr(source, 'chat_id', None) in ROUTES
+            and str(getattr(getattr(source, 'platform', None), 'value', getattr(source, 'platform', None))) == 'slack')
+
+
+def full_notification(board, sub, event, original):
+    """Keep native delivery/retry ownership, but use the event's FULL run result."""
+    if (os.environ.get('RAILWAY_SERVICE_NAME') != 'Hermes-Cap' or board not in ROUTES.values()
+            or sub.get('platform') != 'slack' or event.kind not in ('review_requested', 'completed')):
+        return original
+    from hermes_cli import kanban_db as kb
+    with Router(kb, ROOT).connect(board) as conn:
+        route = conn.execute('SELECT * FROM cap_threads WHERE task_id=?', (sub['task_id'],)).fetchone()
+        if not route or route['channel'] != sub['chat_id'] or route['thread'] != sub.get('thread_id'):
+            return original
+        run = conn.execute('SELECT summary FROM task_runs WHERE id=? AND task_id=?',
+                           (getattr(event, 'run_id', None), sub['task_id'])).fetchone()
+        answer = (run['summary'] if run else None) or (event.payload or {}).get('summary')
+        if not answer:
+            return original
+        label = 'Ready for your review' if event.kind == 'review_requested' else 'Done'
+        return str(answer).strip() + f'\n\n_{label} · `{sub["task_id"]}`_'
+
+
+REACTIONS = ('hourglass_flowing_sand', 'eyes', 'white_check_mark', 'x')
+
+
+def desired_reaction(row):
+    row = dict(row)
+    if row['outcome'] in ('review_requested', 'completed'):
+        return 'white_check_mark'
+    if row['error_id']:
+        return 'x'
+    if row.get('routing_state') == 'preparing':
+        return 'hourglass_flowing_sand'
+    if row['status'] in ('blocked', 'failed', 'cancelled', 'triage'):
+        return 'x'
+    if row['run_id'] is not None:
+        if row['ended_at'] is not None:
+            return 'x'
+        if row['status'] == 'running':
+            return 'eyes'
+    return 'hourglass_flowing_sand'
+
+
+def slack_adapter(gateway):
+    for platform, adapter in gateway.adapters.items():
+        if str(getattr(platform, 'value', platform)) == 'slack':
+            return adapter
+    raise RuntimeError('Slack adapter unavailable')
+
+
+async def set_reaction(adapter, channel, message, desired):
+    client = adapter._get_client(channel, team_id=WORKSPACE)
+    # Direct native client calls preserve idempotent Slack error codes instead
+    # of the adapter helpers' ambiguous False for both duplicates and failures.
+    for operation, emoji in [('add', desired)] + [('remove', e) for e in REACTIONS if e != desired]:
+        try:
+            result = await getattr(client, 'reactions_' + operation)(channel=channel, timestamp=message, name=emoji)
+            if result.get('ok') is False:
+                raise RuntimeError('Slack rejected reaction')
+        except Exception as exc:
+            response = getattr(exc, 'response', {})
+            code = response.get('error') if hasattr(response, 'get') else None
+            if (operation, code) in (('add', 'already_reacted'), ('remove', 'no_reaction')):
+                continue
+            raise
+
+
+async def update_feedback(gateway, router, board):
+    adapter = slack_adapter(gateway)
+    if not adapter._reactions_enabled():
+        return
+    with router.connect(board) as conn:
+        # Adopt only the newest pre-upgrade request in each thread, not every
+        # historical message. Restarting never replays old textual answers.
+        with conn:
+            conn.execute('INSERT OR IGNORE INTO cap_feedback(seq,run_id) '
+                'SELECT m.seq,CASE WHEN m.seq<=t.consumed THEN '
+                '(SELECT MAX(id) FROM task_runs WHERE task_id=t.task_id) ELSE NULL END '
+                'FROM cap_threads t JOIN cap_messages m ON m.seq='
+                '(SELECT MAX(seq) FROM cap_messages WHERE route_key=t.route_key)')
+        rows = conn.execute('SELECT f.*,m.message_id,t.channel,t.error_id,t.state AS routing_state,k.status,r.outcome,r.ended_at '
+            'FROM cap_feedback f JOIN cap_messages m ON m.seq=f.seq '
+            'JOIN cap_threads t ON t.route_key=m.route_key JOIN tasks k ON k.id=t.task_id '
+            'LEFT JOIN task_runs r ON r.id=f.run_id WHERE f.next_attempt<=?', (time.time(),)).fetchall()
+    for row in rows:
+        desired = desired_reaction(row)
+        if row['reaction'] == desired:
+            continue
+        try:
+            await set_reaction(adapter, row['channel'], row['message_id'], desired)
+        except Exception as exc:
+            error_id = f'{board}-reaction-{row["seq"]}'
+            response = getattr(exc, 'response', {})
+            code = response.get('error', '') if hasattr(response, 'get') else ''
+            safe_code = code if isinstance(code, str) and re.fullmatch(r'[a-z_]{1,60}', code) else 'unknown'
+            emit('cap_reaction_delivery_failed', error_id=error_id, error_type=type(exc).__name__, code=safe_code)
+            with router.connect(board) as conn, conn:
+                conn.execute('UPDATE cap_feedback SET failures=failures+1,next_attempt=? WHERE seq=?',
+                    (time.time() + min(300, 5 * 2 ** min(row['failures'], 6)), row['seq']))
+        else:
+            with router.connect(board) as conn, conn:
+                conn.execute('UPDATE cap_feedback SET reaction=?,failures=0,next_attempt=0 WHERE seq=?',
+                             (desired, row['seq']))
+            emit('cap_reaction_delivered', board=board, seq=row['seq'], reaction=desired)
 
 
 async def send(gateway, channel, thread, text):
@@ -299,7 +421,8 @@ async def pump(gateway):
                         'JOIN cap_threads t USING(route_key) WHERE m.delivered=0 ORDER BY m.seq').fetchall()
                 for message in pending:
                     try:
-                        await send(gateway, message['channel'], message['thread'], message['ack'])
+                        if message['ack']:
+                            await send(gateway, message['channel'], message['thread'], message['ack'])
                     except Exception as exc:
                         emit('cap_ack_delivery_failed', board=board, seq=message['seq'], error_type=type(exc).__name__)
                     else:
@@ -313,11 +436,26 @@ async def pump(gateway):
         await asyncio.sleep(5)
 
 
+async def feedback_pump(gateway):
+    from hermes_cli import kanban_db as kb
+    router = Router(kb)
+    while True:
+        for board in ROUTES.values():
+            try:
+                await update_feedback(gateway, router, board)
+            except Exception as exc:
+                emit('cap_feedback_tick_failed', board=board, error_type=type(exc).__name__)
+        await asyncio.sleep(3)
+
+
 def start(gateway):
     if os.environ.get('RAILWAY_SERVICE_NAME') == 'Hermes-Cap':
         task = getattr(gateway, '_cap_routing_task', None)
         if task is None or task.done():
             gateway._cap_routing_task = asyncio.create_task(pump(gateway))
+        feedback = getattr(gateway, '_cap_feedback_task', None)
+        if feedback is None or feedback.done():
+            gateway._cap_feedback_task = asyncio.create_task(feedback_pump(gateway))
 
 
 async def dispatch(event, gateway):
