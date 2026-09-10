@@ -1,5 +1,30 @@
 # Verified native Cap workflow
 
+## Google Sheets setup — key encoding correction pending approval
+
+Helper implementation `73ab706`, startup recovery `ea256d1`; current successful
+Cap deployment `bbe0902c-f1fa-4924-904f-b6f101095f17`. 99 targeted tests pass.
+
+- Derek approved copying Vee's default `GOOGLE_SERVICE_ACCOUNT_EMAIL` and
+  `GOOGLE_SERVICE_API_KEY` into Cap, plus a read-only Sheets helper. Only those
+  variables were added; Vee and other agents were not changed.
+- The initial transfer incorrectly decoded the source dotenv key's double-escaped
+  line breaks. The copied key failed validation and deployment
+  `933894a9-38eb-49e6-b1e0-f41a022b6eb8` crashed during startup. No sheet access
+  was verified. A candidate stdin-over-Railway-SSH test timed out and also
+  provides no evidence of working access.
+- Recovery now catches optional Sheets setup failures, logs a sanitized error
+  ID, disables the helper and continues gateway startup. Live checks confirm
+  the helper and instructions are installed, Sheets is disabled, and the
+  gateway process is running on the successful recovery deployment.
+- Read-only OpenSSL validation confirms removing the erroneous escape
+  characters yields a valid PEM. No corrected secret has been written:
+  auto-review requires Derek's separate explicit approval to overwrite the
+  now-existing Cap variable. An approval question has been sent.
+- Next: obtain approval for that exact key-format correction, update only
+  Cap's `GOOGLE_SERVICE_API_KEY`, redeploy, verify MCF Bush metadata and headers,
+  then verify a Codex command-tool read. Do not claim Sheets access works yet.
+
 ## Slack feedback permission follow-up
 
 After Derek added `reactions:write`, live add/read-back tests passed for queued,
