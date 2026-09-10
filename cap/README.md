@@ -14,8 +14,23 @@ Bootstrap creates missing files only. Cap's default Hermes profile lives in
 `/data/.hermes`; native Codex login/session state uses `/data/.codex` (the image
 sets HOME=/data). The service must also set `CODEX_HOME=/data/.codex`: Hermes
 changes HOME for its subprocesses, so HOME alone points the runtime at the wrong
-login directory. Workspaces live under `/data/cap`. Nothing is copied
-from an existing agent's volume or environment.
+login directory. Workspaces live under `/data/cap`. Other agents' auth is not
+copied automatically; the operator-approved Sheets account is described below.
+
+## Client source Google Sheets
+
+With Derek's approval, Cap uses Vee's existing client-data service account via
+`GOOGLE_SERVICE_ACCOUNT_EMAIL` and `GOOGLE_SERVICE_API_KEY` (a PEM private key,
+despite the variable name). No personal OAuth tokens are copied. Startup
+validates and materializes these two values to the app-owned file
+`/data/cap/credentials/google-sheets.json` (0600; parent 0700), outside all repos.
+Codex commands need not inherit private-key environment variables. The helper
+`python3 /app/cap/sheets.py` supports `metadata` and `read` only, requests the
+Sheets read-only scope, and never prints credentials or raw upstream errors.
+SOUL and each routed worker prompt point to the helper. See `sheets-guide.md`.
+This is not enforced read-only access for arbitrary commands in the container:
+the shared service account may have wider Google permissions. Do not represent
+helper restrictions as a sandbox. No client source writes are authorized.
 
 ## Approved execution boundary
 

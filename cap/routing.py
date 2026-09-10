@@ -271,6 +271,9 @@ def worker_prompt(task, workspace, board):
                 (task.current_run_id, row['route_key'], messages[-1]['seq']))
         latest = messages[-1]['text']
         return ('\n\nThis is a routed Slack task. Read kanban_show and its comments for full history. '
+                'For private Google source sheets use python3 /app/cap/sheets.py metadata SHEET_ID '
+                'or python3 /app/cap/sheets.py read SHEET_ID A1_RANGE; authenticated read-only access is installed. '
+                'Never read or print credentials. '
                 'Respond to the latest request below; do not repeat completed work. '
                 'Use the mapped workspace only. Finish with kanban_request_review with your answer, '
                 'PR and preview where applicable. A question or proposal is not permission to edit. '

@@ -1,6 +1,14 @@
 # Verified native Cap workflow
 
-## Slack feedback rollout — permission still required
+## Slack feedback permission follow-up
+
+After Derek added `reactions:write`, live add/read-back tests passed for queued,
+working and completed reactions on the existing test DM. The running watcher
+also recovered task `t_b63a971b` message sequence 2 to `white_check_mark`, with
+zero failures, while the task remained in Review. The initial blocker below
+is historical, not the current permission state.
+
+## Slack feedback initial rollout
 
 Implementation `98b840b`, Cap deployment
 `5abdf442-dd72-4762-bfc9-bc502d93f2b2` (successful).
