@@ -1,5 +1,44 @@
 # Verified native Cap workflow
 
+## Enforced routing rollout
+
+Implementation: `e5abe92`, deployed only to Hermes-Cap as
+`d93ea9e8-e733-4f74-a95c-3b84c473606f`.
+
+- 66 local tests pass. The installed-Hermes smoke test also passes with
+  isolated boards and real local Git worktrees: deduplication, sticky preparation
+  hold, separate boards, native subscriptions, Review follow-ups, scoped PR
+  guard exemption, and preservation of authentication guards.
+- Existing vw-site thread `1788976794.031949` is registered as native task
+  `t_631463fd`, with its six historical Slack text messages imported as comments.
+- PR #15 and branch `design/deep-mocha-textures` were preserved. Its checkout
+  was copied from `/tmp/vw-mocha` to the persistent volume and Git's worktree
+  metadata repaired. The old temporary checkout's `.git` pointer was renamed
+  `.git.before-persistent-move`; no application source was deleted.
+- A clearly labeled read-only setup request was posted by Cap's own bot in the
+  existing thread (`1789015006.262799`) and ingested through the router. This
+  exercised native worker dispatch and result delivery, not a new human Slack
+  ingress event. Authorization/ingress selection is covered by local tests.
+- The durable request survived the follow-up deployment, dispatched native
+  Codex run 4, and returned the task to Review. The worker confirmed actual
+  `pwd`, branch, HEAD, clean status and GitHub PR state through commands.
+- Slack read-back verified the router acknowledgement and native Review result
+  `CAP_ROUTING_VERIFIED` at `1789015410.386849`. The complete result is retained
+  on the native card; the native Slack notifier sends the first summary line.
+- Independent Git and GitHub reads after the worker finished confirmed clean
+  checkout, unchanged SHA `2262ad1041e782ff608b89bea392b78767cea9df`, and PR #15
+  still open, draft and unmerged. No application edits, commits, pushes or merges
+  were performed by the verification. The existing preview was not revalidated.
+- Team stayed on `f3a86410-0e05-4e00-90d9-aa4d237e453a`; Owners stayed on
+  `8764a80b-1b82-499c-8dc0-4983271624fc`. No production env vars were changed.
+
+Known boundaries: routed entry and worker launch are deterministic, but Cap's
+approved full-container command access is unchanged. This is not filesystem
+confinement or a GitHub-enforced merge approval gate. Acknowledgements are
+at-least-once if Slack accepts a send immediately before a DB/process failure.
+
+## Earlier infrastructure-only verification
+
 Source implementation: `171df57` (branch `cap/railway-native`).
 Runtime deployment: `44ff30a3-73b8-47cd-a0ea-b8b8d91662e6`, Hermes-Cap only.
 
