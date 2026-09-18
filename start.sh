@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+export HERMES_TERMINAL_CWD="${HERMES_TERMINAL_CWD:-/data/cap/repos}"
+
 # This dedicated branch is deployed only to the new Hermes-Cap service.
 python3 /app/cap/bootstrap.py
 python3 /app/cap/configure_workflow.py
@@ -22,7 +24,7 @@ mkdir -p /data/.hermes/cron /data/.hermes/sessions /data/.hermes/logs \
          /data/.hermes/memories /data/.hermes/skills /data/.hermes/platforms/pairing \
          /data/.hermes/hooks /data/.hermes/cache/images /data/.hermes/cache/audio \
          /data/.hermes/workspace /data/.hermes/skins /data/.hermes/plans \
-         /data/.hermes/home
+         /data/.hermes/home "${HERMES_TERMINAL_CWD}"
 
 # Offer the fork's readable dashboard skin through Hermes's native picker.
 # Seed only missing files so a locally customized theme survives redeploys.

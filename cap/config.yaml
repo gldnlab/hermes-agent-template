@@ -6,12 +6,12 @@ agent:
   max_turns: 60
 terminal:
   backend: local
-  cwd: /data/cap/workspace
+  cwd: /data/cap/repos
 plugins:
   enabled: []
 kanban:
   dispatch_in_gateway: false
-  default_workdir: /data/cap/workspace
+  default_workdir: /data/cap/repos
 approvals:
   mode: manual
 display:

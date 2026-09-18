@@ -65,6 +65,7 @@ templates = Jinja2Templates(directory=str(Path(__file__).parent / "templates"))
 
 HERMES_HOME = os.environ.get("HERMES_HOME", str(Path.home() / ".hermes"))
 ENV_FILE = Path(HERMES_HOME) / ".env"
+TERMINAL_CWD = os.environ.get("HERMES_TERMINAL_CWD", "/data/cap/repos").strip() or "/data/cap/repos"
 
 # The Hermes release this image pins. The Dockerfile promotes its `ARG
 # HERMES_REF` to an ENV so we can read it here; a Railway service variable of
@@ -594,7 +595,7 @@ def write_config_yaml(
     merged_terminal = dict(merged.get("terminal") if isinstance(merged.get("terminal"), dict) else {})
     merged_terminal["backend"] = "local"
     merged_terminal["timeout"] = 60
-    merged_terminal["cwd"] = "/tmp"
+    merged_terminal["cwd"] = TERMINAL_CWD
     merged["terminal"] = merged_terminal
 
     # Pin the browser backend off, because this image opts into the new one by
@@ -956,7 +957,7 @@ def _apply_xai_oauth_config(model: str) -> None:
     merged_terminal = dict(merged.get("terminal") if isinstance(merged.get("terminal"), dict) else {})
     merged_terminal.setdefault("backend", "local")
     merged_terminal.setdefault("timeout", 60)
-    merged_terminal.setdefault("cwd", "/tmp")
+    merged_terminal["cwd"] = TERMINAL_CWD
     merged["terminal"] = merged_terminal
 
     merged_agent = dict(merged.get("agent") if isinstance(merged.get("agent"), dict) else {})

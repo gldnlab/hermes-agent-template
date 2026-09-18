@@ -10,6 +10,8 @@ def seed(root: Path, templates: Path, *, service: str) -> dict:
     home = root / '.hermes'
     home.mkdir(parents=True, exist_ok=True)
     (root / 'cap' / 'workspace').mkdir(parents=True, exist_ok=True)
+    repos = root / 'cap' / 'repos'
+    repos.mkdir(parents=True, exist_ok=True)
     (root / '.codex').mkdir(mode=0o700, exist_ok=True)
     created = []
     for name in ('config.yaml', 'SOUL.md'):
@@ -29,6 +31,13 @@ def seed(root: Path, templates: Path, *, service: str) -> dict:
             destination.write((templates / 'codex-config.toml').read_text())
         codex_config.chmod(0o600)
         created.append('.codex/config.toml')
+    except FileExistsError:
+        pass
+    agents = repos / 'AGENTS.md'
+    try:
+        with agents.open('x') as destination:
+            destination.write((templates / 'workspace-AGENTS.md').read_text())
+        created.append('cap/repos/AGENTS.md')
     except FileExistsError:
         pass
     return {'event': 'cap_bootstrap', 'created': created,

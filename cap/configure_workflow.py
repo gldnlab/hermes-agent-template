@@ -16,7 +16,7 @@ def configure(config):
     if 'kanban' not in toolsets:
         toolsets.append('kanban')
     config['toolsets'] = toolsets
-    config['terminal'] = {**config.get('terminal', {}), 'cwd': '/data/cap/workspace'}
+    config['terminal'] = {**config.get('terminal', {}), 'cwd': '/data/cap/repos'}
     config['kanban'] = {**config.get('kanban', {}),
                         'dispatch_in_gateway': True, 'review_dispatch': False,
                         'auto_decompose': False, 'dispatch_interval_seconds': 10,

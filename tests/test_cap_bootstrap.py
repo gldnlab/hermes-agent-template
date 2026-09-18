@@ -13,7 +13,8 @@ spec.loader.exec_module(bootstrap)
 def test_fresh_cap_is_native_but_does_not_dispatch(tmp_path):
     result = bootstrap.seed(tmp_path, CAP, service='Hermes-Cap')
     config = yaml.safe_load((tmp_path / '.hermes/config.yaml').read_text())
-    assert result['created'] == ['config.yaml', 'SOUL.md', '.codex/config.toml']
+    assert result['created'] == ['config.yaml', 'SOUL.md', '.codex/config.toml',
+                                 'cap/repos/AGENTS.md']
     assert config['model']['openai_runtime'] == 'codex_app_server'
     assert config['plugins']['enabled'] == []
     assert config['kanban']['dispatch_in_gateway'] is False
@@ -26,6 +27,9 @@ def test_fresh_cap_is_native_but_does_not_dispatch(tmp_path):
     assert policy == ['sandbox_mode = "danger-full-access"',
                       'approval_policy = "on-request"']
     assert codex_config.stat().st_mode & 0o777 == 0o600
+    workspace_instructions = tmp_path / 'cap/repos/AGENTS.md'
+    assert all(repo in workspace_instructions.read_text()
+               for repo in ('vw-site', 'vw-hq', 'vw-crm', 'vw-dashboards'))
 
 
 def test_redeploy_preserves_configuration_and_identity(tmp_path):
@@ -36,12 +40,15 @@ def test_redeploy_preserves_configuration_and_identity(tmp_path):
     soul.write_text('Operator-customized Cap')
     codex_config = tmp_path / '.codex/config.toml'
     codex_config.write_text('sandbox_mode = "read-only"\n')
+    workspace_instructions = tmp_path / 'cap/repos/AGENTS.md'
+    workspace_instructions.write_text('Operator-customized workspace instructions\n')
     auth = tmp_path / '.codex/auth.json'
     auth.write_text('{"test_credential": "preserve"}\n')
     assert bootstrap.seed(tmp_path, CAP, service='Hermes-Cap')['created'] == []
     assert config.read_text() == 'operator_configuration: keep\n'
     assert soul.read_text() == 'Operator-customized Cap'
     assert codex_config.read_text() == 'sandbox_mode = "read-only"\n'
+    assert workspace_instructions.read_text() == 'Operator-customized workspace instructions\n'
     assert auth.read_text() == '{"test_credential": "preserve"}\n'
 
 

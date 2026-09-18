@@ -24,6 +24,7 @@ def test_configure_preserves_user_settings_and_requires_human_review():
     assert result['display'] == original['display']
     assert result['model'] == original['model']
     assert result['toolsets'] == ['web', 'kanban']
+    assert result['terminal']['cwd'] == '/data/cap/repos'
     assert result['kanban']['custom'] == 'keep'
     assert result['kanban']['dispatch_in_gateway'] is True
     assert result['kanban']['review_dispatch'] is False
