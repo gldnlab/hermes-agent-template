@@ -67,8 +67,12 @@ RUN apt-get update && \
 # GLOBAL cutoff, so any date before 2026-08-07 leaves nemo-relay>=0.7.1
 # unsatisfiable and hard-fails the build. Same trap for cryptography==50.0.0
 # and h2 4.4.1. If you ever need that flag, pass a date >= 2026-08-07.
+# Hermes v2026.8.27 pins slack-sdk 3.43.0. Override only that pin with 3.44.1,
+# which fixes the aiohttp Socket Mode retry loop after its session closes.
 RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/hermes-agent.git /opt/hermes-agent && \
     cd /opt/hermes-agent && \
+    grep -q 'slack-sdk==3.43.0' pyproject.toml && \
+    sed -i 's/slack-sdk==3.43.0/slack-sdk==3.44.1/g' pyproject.toml && \
     uv pip install --system --no-cache -e ".[all,messaging,tts-premium,honcho,bedrock,anthropic,edge-tts,hindsight,vision]" && \
     cd /opt/hermes-agent/web && \
     npm install --silent && \
