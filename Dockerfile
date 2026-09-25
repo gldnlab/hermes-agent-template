@@ -8,7 +8,7 @@ FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 # newest tag (format `vYYYY.M.D`, optionally with a `.PATCH` suffix, e.g.
 # `v2026.5.29.2`) and update the default below. Use `main` only if you accept
 # that every rebuild can pull arbitrary new upstream commits.
-ARG HERMES_REF=v2026.8.27
+ARG HERMES_REF=v2026.9.24
 
 # Persist the build arg into the runtime env so the admin UI can display which
 # Hermes release this image actually pins. Reading it (rather than hardcoding a
@@ -67,12 +67,12 @@ RUN apt-get update && \
 # GLOBAL cutoff, so any date before 2026-08-07 leaves nemo-relay>=0.7.1
 # unsatisfiable and hard-fails the build. Same trap for cryptography==50.0.0
 # and h2 4.4.1. If you ever need that flag, pass a date >= 2026-08-07.
-# Hermes v2026.8.27 pins slack-sdk 3.43.0. Override only that pin with 3.44.1,
-# which fixes the aiohttp Socket Mode retry loop after its session closes.
+# v2026.9.24 pins slack-sdk 3.44.1 upstream (the Socket Mode retry fix this
+# branch used to patch in), so the pin override is gone. Fail loudly if a
+# future bump regresses it.
 RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/hermes-agent.git /opt/hermes-agent && \
     cd /opt/hermes-agent && \
-    grep -q 'slack-sdk==3.43.0' pyproject.toml && \
-    sed -i 's/slack-sdk==3.43.0/slack-sdk==3.44.1/g' pyproject.toml && \
+    grep -q 'slack-sdk==3.44.1' pyproject.toml && \
     uv pip install --system --no-cache -e ".[all,messaging,tts-premium,honcho,bedrock,anthropic,edge-tts,hindsight,vision]" && \
     cd /opt/hermes-agent/web && \
     npm install --silent && \
@@ -148,6 +148,18 @@ RUN npm install --global --ignore-scripts --no-audit --no-fund @openai/codex@0.1
 # bundled general plugins automatically, but still requires an operator to add
 # `slack-worktree-router` to the default Hermes-Team (Atlas) profile only.
 COPY plugins/slack-worktree-router/ /opt/hermes-agent/plugins/slack-worktree-router/
+# Claude Subscription DirectSDK model provider (needs Hermes >= 0.21.4, i.e.
+# v2026.9.21+). Pinned to the plugin commit and the Claude Code release the
+# plugin README qualifies. start.sh links it into $HERMES_HOME/plugins, where
+# model-provider discovery looks. Auth comes from CLAUDE_CODE_OAUTH_TOKEN
+# (`claude setup-token`) in the Railway env; ANTHROPIC_API_KEY/_AUTH_TOKEN/
+# _BASE_URL must NOT be set on this service or the plugin refuses to run.
+RUN npm install --global --no-audit --no-fund @anthropic-ai/claude-code@2.1.263 && \
+    claude --version && \
+    git clone https://github.com/NousResearch/hermes-plugin-claude-subscription-directsdk \
+        /opt/claude-subscription-directsdk-experimental && \
+    cd /opt/claude-subscription-directsdk-experimental && \
+    git checkout --quiet 602393b && rm -rf .git
 RUN chmod +x /app/start.sh
 
 ENV HOME=/data

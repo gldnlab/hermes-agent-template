@@ -7,6 +7,13 @@ export HERMES_TERMINAL_CWD="${HERMES_TERMINAL_CWD:-/data/cap/repos}"
 python3 /app/cap/bootstrap.py
 python3 /app/cap/configure_workflow.py
 
+# Expose the image-pinned Claude subscription provider plugin to Hermes. Only
+# create the link; never replace a plugin an operator installed by hand.
+mkdir -p "${HERMES_HOME:-/data/.hermes}/plugins"
+[ -e "${HERMES_HOME:-/data/.hermes}/plugins/claude-subscription-directsdk-experimental" ] || \
+    ln -s /opt/claude-subscription-directsdk-experimental \
+        "${HERMES_HOME:-/data/.hermes}/plugins/claude-subscription-directsdk-experimental"
+
 # Mirror dashboard-ref-only's startup: create every directory hermes expects
 # and seed a default config.yaml if the volume is empty. Without these,
 # `hermes dashboard` endpoints that hit logs/, sessions/, cron/, etc. can fail
