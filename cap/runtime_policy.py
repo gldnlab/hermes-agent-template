@@ -28,9 +28,10 @@ def patch_source(source):
     replacement = (anchor + '\n'
                    '        from agent.cap_runtime_policy import configure_spawn, container_boundary\n'
                    '        configure_spawn(spawn_env)')
-    condition = '        if spawn_env.get("HERMES_KANBAN_TASK"):'
-    new_condition = ('        if spawn_env.get("HERMES_KANBAN_TASK") '
-                     'and not container_boundary():')
+    # v2026.9.x: only dispatcher-owned workers get the kanban sandbox block.
+    condition = '        if owned_task:\n            kanban_db = spawn_env.get("HERMES_KANBAN_DB")'
+    new_condition = ('        if owned_task and not container_boundary():\n'
+                     '            kanban_db = spawn_env.get("HERMES_KANBAN_DB")')
     if source.count(anchor) != 1 or source.count(condition) != 1:
         raise RuntimeError('Hermes Codex adapter changed; review Cap compatibility patch')
     return source.replace(anchor, replacement).replace(condition, new_condition)

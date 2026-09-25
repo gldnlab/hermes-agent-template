@@ -132,9 +132,10 @@ def test_feedback_patches_are_narrow_and_fail_on_drift():
     assert patched.count('if owns_event(event):') == 2
     with pytest.raises(RuntimeError):
         patch.patch_slack_feedback(patched)
-    source = 'async def test():\n                            _send_res = await adapter.send(\n                                "test")\n'
+    source = ('async def test(self, ev, msg):\n        _send_res = None\n'
+              '        async def send_ping():\n            pass\n')
     result = patch.patch_notifier(source)
     compile(result, '<notifier>', 'exec')
-    assert 'full_notification(board_slug, sub, ev, msg)' in result
+    assert 'full_notification(self.board_slug, sub, ev, msg)' in result
     with pytest.raises(RuntimeError):
         patch.patch_notifier(result)

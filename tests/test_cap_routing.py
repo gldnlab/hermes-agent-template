@@ -182,8 +182,8 @@ def test_service_dm_and_authorization_gates(monkeypatch, service, channel, scope
 
 
 def test_native_patch_fails_on_drift_and_contains_no_alternative_runner():
-    source = ('async def test():\n        logger.info("Starting Hermes Gateway...")\n'
-              '        # Fire pre_gateway_dispatch plugin hook for user-originated messages.\n')
+    source = ('async def test():\n'
+              '        event = await self._hm_pre_gateway_dispatch_hook(event, source)\n')
     changed = patch.patch_gateway(source)
     compile(changed, '<fixture>', 'exec')
     assert 'await cap_dispatch(event, self)' in changed
@@ -191,8 +191,13 @@ def test_native_patch_fails_on_drift_and_contains_no_alternative_runner():
         patch.patch_gateway(changed)
     with pytest.raises(RuntimeError):
         patch.patch_gateway('changed upstream')
-    worker = patch.patch_kanban('def test():\n    prompt = f"work kanban task {task.id}"\n'
-        '    # 3. Completed run within guard window — proof of recent success.\n')
+    startup = patch.patch_startup('async def test():\n        logger.info("Starting Hermes Gateway...")\n')
+    compile(startup, '<fixture>', 'exec')
+    assert 'start_cap_routing(self)' in startup
+    with pytest.raises(RuntimeError):
+        patch.patch_startup('changed upstream')
+    worker = patch.patch_kanban('def test():\n    cmd = _worker_argv(task, profile_arg, env.get("HERMES_HOME"))\n'
+        '    # 3. Completed run within guard window. Exception: an explicit re-queue\n')
     assert 'worker_prompt(task, workspace, board)' in worker
     compile(worker, '<fixture>', 'exec')
 

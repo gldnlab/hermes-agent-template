@@ -50,7 +50,8 @@ def test_only_caps_github_credential_is_forwarded():
 def test_patch_is_small_and_fails_on_upstream_drift():
     source = ('class Client:\n    def __init__(self):\n'
               '        spawn_env = hermes_subprocess_env(inherit_credentials=True)\n'
-              '        if spawn_env.get("HERMES_KANBAN_TASK"):\n            pass\n')
+              '        if owned_task:\n'
+              '            kanban_db = spawn_env.get("HERMES_KANBAN_DB")\n')
     changed = policy.patch_source(source)
     compile(changed, '<patched>', 'exec')
     assert 'and not container_boundary()' in changed
