@@ -529,5 +529,31 @@ class ReleasePinTests(unittest.TestCase):
         self.assertIn("tokenize='trigram'", dockerfile)
 
 
+
+class ExtraProfileMultiplexTests(UpgradeServerMixin, unittest.TestCase):
+    """Fork: HERMES_EXTRA_PROFILES only spawns profiles opted out of multiplexing."""
+
+    def _write_profile(self, name: str, config: dict | None) -> None:
+        profile = self.home / "profiles" / name
+        profile.mkdir(parents=True, exist_ok=True)
+        if config is not None:
+            (profile / "config.yaml").write_text(yaml.safe_dump(config), encoding="utf-8")
+
+    def test_multiplexed_profile_is_not_standalone(self):
+        self._write_profile("eko", {"model": {"default": "glm"}})
+        self.assertFalse(self.server.profile_is_standalone("eko"))
+
+    def test_missing_or_unreadable_config_is_not_standalone(self):
+        self.assertFalse(self.server.profile_is_standalone("ghost"))
+        self._write_profile("broken", None)
+        (self.home / "profiles" / "broken" / "config.yaml").write_text("gateway: [", encoding="utf-8")
+        self.assertFalse(self.server.profile_is_standalone("broken"))
+
+    def test_explicit_standalone_profile_is_spawnable(self):
+        self._write_profile("pip", {"gateway": {"standalone": True}})
+        self.assertTrue(self.server.profile_is_standalone("pip"))
+        self._write_profile("sol", {"gateway": {"standalone": "yes"}})
+        self.assertFalse(self.server.profile_is_standalone("sol"))
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

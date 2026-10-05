@@ -1862,6 +1862,26 @@ gw = Gateway()
 # Set HERMES_EXTRA_PROFILES=eko,other to auto-start extra profile gateways.
 EXTRA_PROFILES = [p.strip() for p in os.environ.get("HERMES_EXTRA_PROFILES", "").split(",") if p.strip()]
 extra_gateways: list[Gateway] = [Gateway(profile=p) for p in EXTRA_PROFILES]
+
+
+def profile_is_standalone(profile: str) -> bool:
+    """True when a named profile opts out of Hermes' default-profile multiplexer.
+
+    Since v2026.9.x the default gateway serves every named profile in-process
+    (`gateway.multiplex_profiles`, on by default, no opt-out) and refuses a
+    second per-profile gateway with exit 78. Only a profile whose config.yaml
+    sets `gateway.standalone: true` still runs its own gateway, so that is the
+    only kind HERMES_EXTRA_PROFILES may spawn.
+    """
+    import yaml
+
+    config_path = Path(HERMES_HOME) / "profiles" / profile / "config.yaml"
+    try:
+        loaded = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+    except (yaml.YAMLError, OSError):
+        return False
+    gateway_cfg = loaded.get("gateway") if isinstance(loaded, dict) else None
+    return isinstance(gateway_cfg, dict) and gateway_cfg.get("standalone") is True
 cfg_lock = asyncio.Lock()
 
 
@@ -2950,6 +2970,7 @@ async def api_backup_restore(request: Request) -> Response:
                     eg.start()
                     for eg in extra_gateways
                     if (Path(HERMES_HOME) / "profiles" / eg.profile / ".env").exists()
+                    and profile_is_standalone(eg.profile)
                 ])
 
             if rc != 0:
@@ -3353,11 +3374,15 @@ async def auto_start():
     # crash-loop protection as the default profile.
     for eg in extra_gateways:
         profile_env = Path(HERMES_HOME) / "profiles" / eg.profile / ".env"
-        if profile_env.exists():
+        if not profile_env.exists():
+            print(f"[server] Extra profile '{eg.profile}' has no .env — skipping", flush=True)
+        elif not profile_is_standalone(eg.profile):
+            print(f"[server] Extra profile '{eg.profile}' is served by the default gateway's "
+                  f"profile multiplexer — not starting a separate gateway (set "
+                  f"gateway.standalone: true in its config.yaml to run one)", flush=True)
+        else:
             print(f"[server] Starting extra profile gateway: {eg.profile}", flush=True)
             asyncio.create_task(eg.start())
-        else:
-            print(f"[server] Extra profile '{eg.profile}' has no .env — skipping", flush=True)
 
 
 @asynccontextmanager
