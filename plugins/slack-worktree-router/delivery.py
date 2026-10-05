@@ -1,6 +1,7 @@
 """Persistent Railway inbox/outbox and restart-safe Slack result delivery."""
 from __future__ import annotations
 
+import contextvars
 import fcntl
 import hashlib
 import json
@@ -188,5 +189,12 @@ class Delivery:
 
     def start(self):
         if self.thread is None or not self.thread.is_alive():
-            self.thread = threading.Thread(target=self.run, name='atlas-delivery', daemon=True)
+            # Run the worker in the starter's context. Hermes v2026.9.x serves
+            # several profiles from one gateway process and tracks the active
+            # profile in contextvars; a bare thread starts with an empty context,
+            # so get_hermes_home()/load_gateway_config() would resolve to the
+            # default profile and drain its inbox instead of this profile's.
+            ctx = contextvars.copy_context()
+            self.thread = threading.Thread(target=ctx.run, args=(self.run,),
+                                           name='atlas-delivery', daemon=True)
             self.thread.start()
