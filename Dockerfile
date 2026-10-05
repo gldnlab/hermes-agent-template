@@ -69,7 +69,7 @@ db.close()"
 # newest tag (format `vYYYY.M.D`, optionally with a `.PATCH` suffix, e.g.
 # `v2026.5.29.2`) and update the default below. Use `main` only if you accept
 # that every rebuild can pull arbitrary new upstream commits.
-ARG HERMES_REF=v2026.9.21
+ARG HERMES_REF=v2026.9.24
 
 # Persist the build arg into the runtime env so the admin UI can display which
 # Hermes release this image actually pins. Reading it (rather than hardcoding a
@@ -129,9 +129,13 @@ RUN apt-get update && \
 # 2026-09-02 leaves nemo-relay>=0.8.3 unsatisfiable and hard-fails the build.
 # Same trap for cryptography==50.0.0 and h2 4.4.1. Re-read this floor on every
 # bump — it tracks whatever nemo-relay pin the pinned tag carries.
+#
+# v2026.9.24 dropped the `hindsight` extra: Hindsight memory now installs from
+# the plugin catalog (`hermes plugins install`), not pip. None of our profiles
+# use it (memory.provider is unset everywhere), so it is no longer listed.
 RUN git clone --depth 1 --branch ${HERMES_REF} https://github.com/NousResearch/hermes-agent.git /opt/hermes-agent && \
     cd /opt/hermes-agent && \
-    uv pip install --system --no-cache -e ".[all,messaging,tts-premium,honcho,bedrock,anthropic,edge-tts,hindsight,vision]" && \
+    uv pip install --system --no-cache -e ".[all,messaging,tts-premium,honcho,bedrock,anthropic,edge-tts,vision]" && \
     cd /opt/hermes-agent/web && \
     npm install --silent && \
     npm run build && \

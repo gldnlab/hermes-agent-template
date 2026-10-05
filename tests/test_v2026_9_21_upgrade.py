@@ -47,7 +47,7 @@ class UpgradeServerMixin:
             {
                 "HERMES_HOME": str(self.home),
                 "ADMIN_PASSWORD": "test-password",
-                "HERMES_REF": "v2026.9.21",
+                "HERMES_REF": "v2026.9.24",
             },
             clear=True,
         )
@@ -519,7 +519,7 @@ class RouterProviderUiTests(unittest.TestCase):
 class ReleasePinTests(unittest.TestCase):
     def test_dockerfile_pins_target_release(self):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
-        self.assertIn("ARG HERMES_REF=v2026.9.21", dockerfile)
+        self.assertIn("ARG HERMES_REF=v2026.9.24", dockerfile)
 
     def test_dockerfile_pins_fixed_sqlite_runtime(self):
         dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
