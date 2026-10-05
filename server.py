@@ -41,6 +41,7 @@ import zipfile
 from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
+from urllib.parse import urlsplit
 
 import httpx
 import websockets
@@ -285,6 +286,15 @@ ENV_VARS = [
     ("OLLAMA_API_KEY",           "Ollama Cloud",             "provider",  True),
     ("AZURE_FOUNDRY_API_KEY",    "Azure Foundry key",        "provider",  True),
     ("AZURE_FOUNDRY_BASE_URL",   "Azure Foundry URL",        "azure",     False),
+    # OpenAI-compatible routing gateways. These are separate saved slots rather
+    # than aliases for CUSTOM_PROVIDER_* so users can keep both routers (and a
+    # generic custom endpoint) configured at the same time. Their URLs are
+    # deployment-specific — especially on Railway private networking — so only
+    # the setup-page examples are fixed; the values themselves never are.
+    ("NINEROUTER_API_KEY",        "9Router endpoint key",      "provider",  True),
+    ("NINEROUTER_BASE_URL",       "9Router base URL",          "router",    False),
+    ("OMNIROUTE_API_KEY",         "OmniRoute endpoint key",    "provider",  True),
+    ("OMNIROUTE_BASE_URL",        "OmniRoute base URL",        "router",    False),
     # Custom OpenAI-compatible endpoint — one slot; more via Hermes dashboard.
     # Only the API key is in category "provider" so PROVIDER_KEYS / is_config_complete
     # only trigger when an actual key is present, not just a base URL.
@@ -293,7 +303,20 @@ ENV_VARS = [
     ("CUSTOM_PROVIDER_NAME",     "Custom Provider name",     "custom",    False),
     ("PARALLEL_API_KEY",         "Parallel (search)",        "tool",      True),
     ("FIRECRAWL_API_KEY",        "Firecrawl (scrape)",       "tool",      True),
+    ("KEENABLE_API_KEY",         "Keenable (search)",        "tool",      True),
+    # Tavily was DELETED in v2026.8.31 (so we dropped this field) and RESTORED in
+    # v2026.9.11 — upstream reverted the removal, and tools/tool_backend_helpers.py
+    # now carries an empty REMOVED_BACKENDS registry naming that revert. Anyone who
+    # had selected Tavily as their web backend before the deletion has had a hard
+    # error on every search since, because tools/web_tools.py:_get_backend() returns
+    # a stored selection strictly with no fallback; restoring the field lets them see
+    # and re-enter the key. Optional by design: Tavily also works keyless once it is
+    # the selected backend, so an empty value here is a valid state.
     ("TAVILY_API_KEY",           "Tavily (search)",          "tool",      True),
+    # New vendor in v2026.9.11 (plugins/web/perplexity). Key is REQUIRED — unlike
+    # Tavily/Keenable it has no keyless tier — and it now sits second in the
+    # autodetect ladder, so a key here is picked up on a never-configured install.
+    ("PERPLEXITY_API_KEY",       "Perplexity (search)",      "tool",      True),
     ("FAL_KEY",                  "FAL (image gen)",          "tool",      True),
     ("BROWSERBASE_API_KEY",      "Browserbase key",          "tool",      True),
     ("BROWSERBASE_PROJECT_ID",   "Browserbase project",      "tool",      False),
@@ -363,6 +386,13 @@ HERMES_PROVIDER_IDS = {
     "KILOCODE_API_KEY":      "kilocode",
     "OLLAMA_API_KEY":        "ollama-cloud",
     "AZURE_FOUNDRY_API_KEY": "azure-foundry",
+    # Named user providers written under config.yaml's `providers:` mapping.
+    # These are not built-in Hermes plugins: writing the definition first lets
+    # Hermes' own model/set path resolve the id, preserve slash-prefixed router
+    # model names verbatim, and carry key_env instead of copying the secret into
+    # config.yaml's model block.
+    "NINEROUTER_API_KEY":     "ninerouter",
+    "OMNIROUTE_API_KEY":      "omniroute",
     # Fireworks and Novita are routed through provider="custom" with a fixed
     # base_url (CUSTOM_STYLE_BASE_URLS below) rather than their native ids.
     #
@@ -401,6 +431,46 @@ CUSTOM_STYLE_BASE_URLS = {
 # api_config_put()'s pin call and write_config_yaml()'s fallback below —
 # no other code needs to change.
 HERMES_CUSTOM_STYLE_KEYS = {k for k, v in HERMES_PROVIDER_IDS.items() if v == "custom"}
+
+# Template-managed named OpenAI-compatible routing gateways. `base_url_key` is
+# deliberately independent for each entry; unlike the one generic custom slot,
+# both routers can coexist and be switched through Hermes' normal provider path.
+MANAGED_ROUTER_PROVIDERS = {
+    "NINEROUTER_API_KEY": {
+        "provider_id": "ninerouter",
+        "name": "9Router",
+        "base_url_key": "NINEROUTER_BASE_URL",
+    },
+    "OMNIROUTE_API_KEY": {
+        "provider_id": "omniroute",
+        "name": "OmniRoute",
+        "base_url_key": "OMNIROUTE_BASE_URL",
+    },
+}
+
+
+def _router_base_url(data: dict[str, str], provider_key: str) -> str:
+    spec = MANAGED_ROUTER_PROVIDERS.get(provider_key)
+    if not spec:
+        return ""
+    return data.get(spec["base_url_key"], "").strip().rstrip("/")
+
+
+def _router_provider_is_configured(data: dict[str, str], provider_key: str) -> bool:
+    return bool(data.get(provider_key, "").strip() and _router_base_url(data, provider_key))
+
+
+def _router_base_url_error(value: str) -> str | None:
+    """Return a setup-facing error for an unusable router endpoint URL."""
+    try:
+        parsed = urlsplit(value)
+    except ValueError:
+        return "Base URL is invalid."
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "Base URL must be a complete http:// or https:// URL."
+    if parsed.username or parsed.password:
+        return "Base URL must not contain embedded credentials; use the API key field."
+    return None
 
 CHANNEL_MAP  = {
     "Telegram":    "TELEGRAM_BOT_TOKEN",
@@ -546,14 +616,30 @@ def write_config_yaml(
         # unrecognized model name, producing a self-contradictory system
         # prompt and a "confused" identity response.
         if not current_provider:
+            router_key = next(
+                (k for k in MANAGED_ROUTER_PROVIDERS if _router_provider_is_configured(data, k)),
+                None,
+            )
             named_key = next(
-                (k for k in PROVIDER_KEYS if k not in HERMES_CUSTOM_STYLE_KEYS and data.get(k)),
+                (
+                    k for k in PROVIDER_KEYS
+                    if k not in HERMES_CUSTOM_STYLE_KEYS
+                    and k not in MANAGED_ROUTER_PROVIDERS
+                    and data.get(k)
+                ),
                 None,
             )
             custom_style_key = next((k for k in HERMES_CUSTOM_STYLE_KEYS if data.get(k)), None)
             if named_key:
                 merged_model["provider"] = "auto"
                 current_provider = "auto"
+            elif router_key:
+                # Unlike built-in env-var providers, user-defined `providers:`
+                # entries are not discoverable through Hermes' `auto` registry.
+                # Pin the only available router synchronously so a cold boot is
+                # still usable if the dashboard model/set request never ran.
+                merged_model["provider"] = MANAGED_ROUTER_PROVIDERS[router_key]["provider_id"]
+                current_provider = merged_model["provider"]
             elif custom_style_key:
                 # CUSTOM_PROVIDER_API_KEY / FIREWORKS_API_KEY / NOVITA_API_KEY are
                 # NOT in hermes' own PROVIDER_REGISTRY (see HERMES_PROVIDER_IDS'
@@ -627,20 +713,58 @@ def write_config_yaml(
     merged_agent.setdefault("max_iterations", 50)
     merged["agent"] = merged_agent
 
-    # Pin the conversation auto-reset policy so it doesn't depend on volume age.
-    # start.sh seeds cli-config.yaml.example only on a FRESH volume, and
-    # v2026.7.20 flipped that example (and SessionResetPolicy's own default)
-    # from "both" to "none" — so without this an existing deployment keeps
-    # resetting while a newly deployed one never does, from identical code.
-    # We keep "both" (idle + daily): it bounds context growth and preserves the
-    # agent's one turn to persist memories/skills before a wipe.
-    # setdefault, not assignment — unlike terminal.backend this is a user
-    # preference, so a value chosen in hermes' own settings survives.
-    merged_session_reset = dict(merged.get("session_reset") if isinstance(merged.get("session_reset"), dict) else {})
-    merged_session_reset.setdefault("mode", "both")
-    merged["session_reset"] = merged_session_reset
+    # NOTE: we used to pin `session_reset.mode = "both"` here so conversation
+    # auto-reset didn't depend on volume age. v2026.9.11 RETIRED the feature:
+    # SessionResetPolicy is now documented as an "inert legacy value type ...
+    # Gateway configuration and session lifecycle do not consume this datatype"
+    # (gateway/config.py), the config->gateway bridge that read it is gone
+    # (`default_reset_policy` went from 10 references to 0), and hermes dropped
+    # `session_reset` from its own known-root-keys list. Writing it now only
+    # leaves a dead key on disk — unknown top-level keys are deliberately not
+    # warned about, so it would fail silently. Conversations persist until an
+    # explicit /new or /reset; context growth is handled by compression.
 
     merged["data_dir"] = HERMES_HOME
+
+    # Named routing gateways — merge only the two entries this template owns.
+    # User-authored providers and extra per-router fields (model metadata,
+    # headers, context limits, etc.) survive. A blank setup entry removes the
+    # corresponding provider only when its key_env proves we created it; a
+    # manually-authored provider with the same id is never deleted implicitly.
+    existing_providers = merged.get("providers")
+    providers = dict(existing_providers) if isinstance(existing_providers, dict) else {}
+    providers_changed = False
+    for provider_key, spec in MANAGED_ROUTER_PROVIDERS.items():
+        provider_id = spec["provider_id"]
+        base_url = _router_base_url(data, provider_key)
+        current_entry = providers.get(provider_id)
+        managed_entry = (
+            isinstance(current_entry, dict)
+            and str(current_entry.get("key_env") or "").strip() == provider_key
+        )
+        if data.get(provider_key, "").strip() and base_url:
+            entry = dict(current_entry) if isinstance(current_entry, dict) else {}
+            # Avoid retaining a conflicting legacy URL alias: Hermes accepts
+            # api/url/base_url, in that precedence order.
+            entry.pop("url", None)
+            entry.pop("base_url", None)
+            entry.update({
+                "name": spec["name"],
+                "api": base_url,
+                "key_env": provider_key,
+                "transport": "chat_completions",
+                "discover_models": True,
+            })
+            providers[provider_id] = entry
+            providers_changed = True
+        elif managed_entry:
+            providers.pop(provider_id, None)
+            providers_changed = True
+    if providers_changed:
+        if providers:
+            merged["providers"] = providers
+        else:
+            merged.pop("providers", None)
 
     # Custom OpenAI-compatible endpoint — write custom_providers block when configured,
     # remove it when not (safe on Railway where users don't hand-edit config.yaml).
@@ -718,6 +842,16 @@ def hermes_dashboard_auth_secret() -> str:
     return secret
 
 
+# Hermes otherwise generates a new legacy SPA/WS token for every dashboard
+# process. Config saves and restores deliberately respawn that process while an
+# existing Chat page is still open; the page then retries with its old token and
+# every /api/pty + /api/events upgrade is rejected with 403 until the user
+# reloads. Keep the token stable only for this wrapper process's lifetime. It
+# still rotates on every container restart, and gated/public dashboards reject
+# this legacy token in favour of their normal single-use WS tickets.
+_DASHBOARD_SESSION_TOKEN = secrets.token_urlsafe(32)
+
+
 def hermes_dashboard_public_url() -> str:
     """Public origin hermes should build OAuth redirect_uris from, or ""."""
     domain = os.environ.get("RAILWAY_PUBLIC_DOMAIN", "").strip()
@@ -749,9 +883,27 @@ def hermes_dashboard_public_url() -> str:
 # (reproduced locally for HERMES_PARENT_PID against v2026.8.13).
 DASHBOARD_KILLING_KEYS = ("HERMES_PARENT_PID", "HERMES_DASHBOARD_PUBLIC_URL")
 
+# Keys that don't kill the dashboard but change WHO it trusts. hermes loads
+# $HERMES_HOME/.env into its own os.environ with override=True at startup —
+# i.e. AFTER the env build_hermes_env() hands the subprocess — so a value in the
+# FILE beats the credentials we pass. hermes' `basic` provider then registers a
+# different user/password than HermesSession signs in with, every proxied page
+# 502s with DASHBOARD_AUTH_FAILED_HTML, and nothing says why. A restore, a hand
+# edit, or hermes' own Keys tab can all put them there.
+#
+# Only the FILE is policed: hermes_dashboard_credentials() deliberately honours
+# these as explicit overrides when they arrive as real Railway variables.
+DASHBOARD_TRUST_KEYS = (
+    "HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
+    "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
+    "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD_HASH",
+    "HERMES_DASHBOARD_BASIC_AUTH_SECRET",
+    "HERMES_DASHBOARD_SESSION_TOKEN",
+)
+
 # Only a restored or hand-edited .env can carry these, so .env is healed once at
 # boot and after a restore rather than checked on every read.
-ENV_FILE_FORBIDDEN_KEYS = DASHBOARD_KILLING_KEYS
+ENV_FILE_FORBIDDEN_KEYS = DASHBOARD_KILLING_KEYS + DASHBOARD_TRUST_KEYS
 
 
 def build_hermes_env() -> dict[str, str]:
@@ -787,6 +939,55 @@ def build_hermes_env() -> dict[str, str]:
     # config.yaml, and inherited by all three restart paths (in-band, SIGUSR1,
     # and the dashboard's detached restart). setdefault: set e.g. 120 to re-arm.
     env.setdefault("HERMES_RESTART_AFTER_TURN_TIMEOUT", "0")
+    # v2026.8.31 moved the terminal/code-exec scratch root from /tmp to
+    # $HERMES_HOME/cache/terminal whenever TERMINAL_TEMP_DIR and TMPDIR are both
+    # unset (tools/environments/local.py). Upstream's motive was a tmpfs /tmp
+    # filling up; on Railway /tmp is ordinary container disk and $HERMES_HOME is
+    # the PERSISTENT VOLUME, so the new default parks sandbox dirs and
+    # background-job logs on /data, ships them inside every `hermes backup`
+    # (cache/ is not in upstream's _EXCLUDED_DIRS), and lets a locked *.db an
+    # agent script leaves there fail _safe_copy_db — which _live_db_names() then
+    # reports as an incomplete snapshot and ABORTS the restore. Pin the
+    # v2026.8.27 behaviour. Must be an existing absolute dir or hermes ignores it
+    # (/tmp always exists here).
+    env.setdefault("TERMINAL_TEMP_DIR", "/tmp")
+    # v2026.9.21 widened that persistent-scratch default beyond the terminal:
+    # hermes_bootstrap now points generic TMPDIR/TMP/TEMP at
+    # $HERMES_HOME/cache/scratch for EVERY hermes entry point when none is set.
+    # On this Railway image /tmp is ordinary ephemeral container disk, while
+    # HERMES_HOME is the durable volume; browser spools, PTY probes and Python
+    # tempfile users therefore belong in /tmp for the same reason terminal
+    # sandboxes do. Setting only TMPDIR is sufficient: upstream treats any
+    # user-supplied temp variable as authoritative and leaves all three alone.
+    # setdefault preserves an explicit Railway/.env override.
+    env.setdefault("TMPDIR", "/tmp")
+    # Pin every hermes subprocess to the root profile. hermes_cli/main.py's
+    # _apply_profile_override() runs at IMPORT — before argparse — so the
+    # `--external-supervisor` flag we pass (which only sets
+    # HERMES_GATEWAY_EXTERNAL_SUPERVISOR after parsing) is too late to stop it.
+    # It follows $HERMES_HOME/active_profile, which hermes' own dashboard and a
+    # `hermes profile use` in the Chat terminal both write. One such switch would
+    # silently re-home the gateway, the dashboard AND the dashboard's detached
+    # restart under profiles/<name>: pairing, config and the pid record then
+    # diverge from what this admin panel reads, and the next `--replace` refuses
+    # with "pid record belongs to a different HERMES_HOME". v2026.8.31 added this
+    # generic marker (#74872) as the opt-out; it is read ONLY by that guard
+    # (main.py `_under_gateway_supervisor`), never by is_gateway_supervisor_process()
+    # or the s6 redirect, so it cannot alter the exit-75 restart contract.
+    env.setdefault("HERMES_SUPERVISED_CHILD", "1")
+    # Keep hermes' per-token gateway locks OFF the Railway volume. They are
+    # MACHINE-local by intent (gateway/status.py `_get_lock_dir`), but they
+    # default to $HOME/.local/state/hermes/gateway-locks and the Dockerfile sets
+    # HOME=/data — so they land on the volume and outlive a redeploy, while
+    # start.sh only sweeps gateway.pid/.lock/.sock under $HERMES_HOME. That
+    # matters more since v2026.9.11: `is_global_startup_conflict`
+    # (gateway/restart.py, new) reclassifies a `<scope>_lock` conflict at STARTUP
+    # from retryable to fatal, so a single-platform deployment whose one adapter
+    # hits it exits 78 — which this supervisor deliberately never respawns. One
+    # container runs exactly one gateway, so the lock only ever needs to live as
+    # long as the container. /tmp gives it that and nothing more; hermes mkdirs
+    # the path itself. setdefault, so a Railway variable can move it back.
+    env.setdefault("HERMES_GATEWAY_LOCK_DIR", "/tmp/hermes-gateway-locks")
     # Drop inbound values first: the template is the only thing allowed to
     # decide these (this pop covers a Railway service variable, which lands in
     # our own os.environ; _sanitize_env_file() covers the .env file).
@@ -808,8 +1009,22 @@ def build_hermes_env() -> dict[str, str]:
     return env
 
 
+def build_dashboard_env() -> dict[str, str]:
+    """Build the dashboard env with a token stable across in-container respawns.
+
+    Keep this dashboard-only: the gateway neither needs nor should inherit the
+    browser's loopback session credential. An inbound Railway/.env value is
+    intentionally overwritten; this wrapper owns both ends of that trust
+    boundary, and `_sanitize_env_file()` prevents Hermes' override=True dotenv
+    load from replacing it after spawn.
+    """
+    env = build_hermes_env()
+    env["HERMES_DASHBOARD_SESSION_TOKEN"] = _DASHBOARD_SESSION_TOKEN
+    return env
+
+
 def _sanitize_env_file(path: Path = ENV_FILE) -> None:
-    """Drop inherited process keys that would kill a Hermes subprocess."""
+    """Drop .env keys that would kill a Hermes subprocess or break dashboard sign-in."""
     try:
         data = read_env(path)
     except OSError:
@@ -825,17 +1040,32 @@ def _sanitize_env_file(path: Path = ENV_FILE) -> None:
         print(f"[server] could not strip {removed} from {path}: {e}", flush=True)
         return
     print(f"[server] removed {', '.join(removed)} from {path} — it would have "
-          f"shut a Hermes subprocess down", flush=True)
+          f"shut a Hermes subprocess down or broken dashboard sign-in", flush=True)
 
 
 def write_env(path: Path, data: dict[str, str]) -> None:
+    # Single chokepoint keeping ENV_FILE_FORBIDDEN_KEYS out of the FILE, not just
+    # out of the subprocess env. _sanitize_env_file() only runs at boot and after
+    # a restore, but /setup/api/config re-reads .env, merges it and writes it back
+    # — so a key added to the file between boots (hand edit, hermes' own Keys tab)
+    # survived that round-trip and reached the dashboard restart that same save
+    # triggers. Verified live: with a stray HERMES_DASHBOARD_BASIC_AUTH_PASSWORD
+    # the dashboard accepted THAT password and 401'd the template's own, which a
+    # still-valid persisted session hid until the next re-login.
+    forbidden = [k for k in ENV_FILE_FORBIDDEN_KEYS if k in data]
+    if forbidden:
+        data = {k: v for k, v in data.items() if k not in ENV_FILE_FORBIDDEN_KEYS}
+        print(f"[server] refused to write {', '.join(forbidden)} to .env — "
+              f"it would have shut the dashboard down or broken its sign-in",
+              flush=True)
     path.parent.mkdir(parents=True, exist_ok=True)
-    cat_order = ["model", "provider", "bedrock", "azure", "custom", "tool",
+    cat_order = ["model", "provider", "bedrock", "azure", "router", "custom", "tool",
                  "telegram", "discord", "slack", "whatsapp",
                  "email", "mattermost", "matrix", "gateway", "admin"]
     cat_labels = {
         "model": "Model", "provider": "Providers",
         "bedrock": "AWS Bedrock", "azure": "Azure Foundry",
+        "router": "Router Endpoints",
         "custom": "Custom Endpoint", "tool": "Tools",
         "telegram": "Telegram", "discord": "Discord", "slack": "Slack",
         "whatsapp": "WhatsApp", "email": "Email",
@@ -1128,7 +1358,8 @@ def is_config_complete(data: dict[str, str] | None = None) -> bool:
     # than one of the wrapper-managed API-key variables. ``auto`` still needs
     # a discoverable key/token before the gateway is considered configured.
     has_provider = bool(configured_provider and configured_provider != "auto") or any(
-        data.get(k) for k in PROVIDER_KEYS
+        _router_provider_is_configured(data, k) if k in MANAGED_ROUTER_PROVIDERS else bool(data.get(k))
+        for k in PROVIDER_KEYS
     ) or _has_xai_oauth_tokens()
     return has_model and has_provider
 
@@ -1343,6 +1574,23 @@ RESPAWN_MAX_IN_WIN = 5       # give up auto-restart after this many exits in win
 RESPAWN_BASE_DELAY = 2.0     # first backoff (seconds)
 RESPAWN_MAX_DELAY  = 30.0    # backoff cap
 
+# The window above only ever sees loops FASTER than itself: a failure cycle
+# longer than RESPAWN_WINDOW_S / RESPAWN_MAX_IN_WIN (~24s) drops its own history
+# on the next prune, so the counter never reaches the threshold and the guard
+# never fires. v2026.9.11 made that reachable: hermes_startup_watchdog.py (new)
+# os._exit(75)s a gateway that hasn't reached a live event loop in 300s, which
+# is a ~5-minute cycle — the bot never answers, /health stays 200, and the only
+# symptom is one log line every 5 minutes, forever. Upstream hit the same shape
+# and says so in gateway/restart_loop_guard.py: "A fixed-window prune only sees
+# cycles faster than the window (a slower loop drops its history every boot and
+# never trips)". So we also CHAIN exits that are close together AND short-lived.
+# Both conditions matter: the gap bound keeps unrelated failures days apart from
+# chaining, and the uptime bound means a gateway that actually served for a
+# while (an in-band /restart, say) breaks the chain instead of extending it.
+RESPAWN_CHAIN_GAP_S    = 1800   # exits further apart than this start a new chain
+RESPAWN_CHAIN_UPTIME_S = 600    # an exit after MORE uptime than this breaks the chain
+RESPAWN_MAX_CHAIN      = 8      # give up after this many chained short-lived exits
+
 
 # v2026.8.27's cross-profile ownership gate (gateway/run.py) logs this and
 # exits 1 rather than displacing a PID it cannot attribute to this HERMES_HOME.
@@ -1363,6 +1611,11 @@ class Gateway:
         self._stopping = False
         # Monotonic timestamps of recent unexpected exits (crash-loop guard).
         self._recent_exits: list[float] = []
+        # Slow-loop guard: consecutive short-lived exits, and when the last one
+        # landed. Monotonic (never wall clock) so an NTP step can't extend a chain.
+        self._exit_chain = 0
+        self._last_exit_at: float | None = None
+        self._started_monotonic: float | None = None
 
     async def start(self, *, reset_budget: bool = True):
         if self.proc and self.proc.returncode is None:
@@ -1372,6 +1625,8 @@ class Gateway:
         # accumulating toward the give-up threshold.
         if reset_budget:
             self._recent_exits.clear()
+            self._exit_chain = 0
+            self._last_exit_at = None
         self.state = "starting"
         self._stopping = False
         try:
@@ -1419,6 +1674,7 @@ class Gateway:
             )
             self.state = "running"
             self.started_at = time.time()
+            self._started_monotonic = time.monotonic()
             asyncio.create_task(self._drain(self.proc))
         except Exception as e:
             self.state = "error"
@@ -1432,15 +1688,25 @@ class Gateway:
         self.state = "stopping"
         self.proc.terminate()
         try:
-            # 45s, not 20s: v2026.8.27 added `agent.cron_drain_timeout` (default
-            # 30) so a SIGTERM now waits for an in-flight cron job to finish
-            # before tearing down adapters. At 20s we SIGKILLed mid-drain,
-            # defeating that and leaving the job marked running forever. 45s
-            # clears the 30s drain plus adapter teardown (Telegram + Discord +
-            # Slack polling loops) and still sits inside hermes' own 60s
-            # shutdown watchdog. SIGKILL also skips hermes' atexit pid cleanup,
-            # which is exactly the mess _clear_stale_pidfile() then mops up.
-            await asyncio.wait_for(self.proc.wait(), timeout=45)
+            # 70s, not 45s. The stop path is a chain, not one timeout:
+            # `agent.cron_drain_timeout` (30) waits out an in-flight cron job,
+            # + CRON_DRAIN_CLEANUP_RESERVE_S (10), + the new v2026.8.31
+            # `gateway.signal_interrupt_grace_timeout`, + adapter teardown (~5s
+            # each for Telegram/Discord/Slack) + a bounded MCP shutdown + a
+            # PASSIVE WAL checkpoint in SessionDB.close(). With a cron job in
+            # flight that runs ~56s, so 45s landed our SIGKILL mid-teardown.
+            # v2026.8.31 sizes its OWN supervisors at
+            # max(60, max(drain, cron+10) + 30) = 70s
+            # (gateway/restart.py resolve_systemd_timeout_stop_sec) and raised
+            # its orphan-reaper grace 5s -> 30s after a SIGKILL during that
+            # checkpoint corrupted state.db (the 2026-08-31 incident named in
+            # hermes_cli/gateway.py). Matching 70 puts us BEHIND hermes' own 60s
+            # shutdown watchdog, which hard-exits and releases the pid file and
+            # lock itself — so this SIGKILL should now never fire, and the
+            # pid-file mess _clear_stale_pidfile() mops up stops happening.
+            # On a container stop Railway's own grace period is the real
+            # deadline; this bound only governs Restart / config-save.
+            await asyncio.wait_for(self.proc.wait(), timeout=70)
         except asyncio.TimeoutError:
             self.proc.kill()
             await self.proc.wait()
@@ -1464,10 +1730,28 @@ class Gateway:
         # A deliberate stop()/restart()/reset owns its own lifecycle — don't respawn.
         if self._stopping:
             return
+        # Exit 78 = GATEWAY_FATAL_CONFIG_EXIT_CODE (gateway/restart.py): a
+        # config error that no retry can fix — an invalid multiplexer config, or
+        # every enabled platform failing non-retryably. Upstream's own generated
+        # systemd unit pairs Restart=always with
+        # RestartPreventExitStatus=78 for exactly this, and deliberately does
+        # NOT use 78 when the failure is mixed/transient, so honouring it here
+        # cannot suppress a recoverable restart. Respawning would just burn the
+        # crash-loop budget on the same error and bury the reason.
+        if rc == 78:
+            self.state = "crashed"
+            msg = ("[gateway] exited (code 78: fatal config) — not respawning. "
+                   "Fix the configuration, then Start the gateway.")
+            self.logs.append(msg)
+            print(msg, flush=True)
+            return
         # Unexpected exit: in-band `/restart` (exit 75), a crash, or an OOM kill.
         # On Railway nothing else brings the gateway back, so we supervise it.
         self.state = "error"
+        # print() as well as the ring buffer: an unexpected exit is the one
+        # supervisor event worth having in `railway logs` without opening /setup.
         self.logs.append(f"[gateway] exited (code {rc}) — supervising restart")
+        print(f"[gateway] exited (code {rc}) — supervising restart", flush=True)
         asyncio.create_task(self._supervise_respawn(proc.pid))
 
     async def _supervise_respawn(self, dead_pid: int | None):
@@ -1476,16 +1760,31 @@ class Gateway:
         now = time.monotonic()
         self._recent_exits = [t for t in self._recent_exits if now - t < RESPAWN_WINDOW_S]
         self._recent_exits.append(now)
-        if len(self._recent_exits) > RESPAWN_MAX_IN_WIN:
+        # Chain short-lived exits that arrive close together (see RESPAWN_CHAIN_*).
+        uptime = now - self._started_monotonic if self._started_monotonic is not None else 0.0
+        gap = now - self._last_exit_at if self._last_exit_at is not None else None
+        if uptime > RESPAWN_CHAIN_UPTIME_S or (gap is not None and gap > RESPAWN_CHAIN_GAP_S):
+            self._exit_chain = 1
+        else:
+            self._exit_chain += 1
+        self._last_exit_at = now
+        if len(self._recent_exits) > RESPAWN_MAX_IN_WIN or self._exit_chain > RESPAWN_MAX_CHAIN:
             self.state = "crashed"
-            self.logs.append(
-                f"[gateway] crash-looping ({len(self._recent_exits)} exits in "
-                f"{RESPAWN_WINDOW_S}s) — giving up auto-restart. Fix the provider/"
-                f"model in the admin UI, then Start/Restart the gateway."
-            )
+            if self._exit_chain > RESPAWN_MAX_CHAIN:
+                detail = (f"{self._exit_chain} short-lived exits in a row "
+                          f"(each under {RESPAWN_CHAIN_UPTIME_S}s of uptime)")
+            else:
+                detail = f"{len(self._recent_exits)} exits in {RESPAWN_WINDOW_S}s"
+            msg = (f"[gateway] crash-looping ({detail}) — giving up auto-restart. "
+                   f"Check the Logs panel, fix the cause, then Start/Restart the gateway.")
+            self.logs.append(msg)
+            # print() too: a give-up is the terminal state of the supervisor and
+            # must be visible in `railway logs` without opening /setup.
+            print(msg, flush=True)
             return
-        delay = min(RESPAWN_BASE_DELAY * 2 ** (len(self._recent_exits) - 1), RESPAWN_MAX_DELAY)
-        self.logs.append(f"[gateway] restarting in {int(delay)}s (attempt {len(self._recent_exits)})")
+        attempt = max(len(self._recent_exits), self._exit_chain)
+        delay = min(RESPAWN_BASE_DELAY * 2 ** (attempt - 1), RESPAWN_MAX_DELAY)
+        self.logs.append(f"[gateway] restarting in {int(delay)}s (attempt {attempt})")
         await asyncio.sleep(delay)
         # Re-check the deliberate-lifecycle conditions AFTER the backoff sleep: a
         # Stop, Reset, or shutdown issued during the wait must win over the respawn.
@@ -1563,6 +1862,26 @@ gw = Gateway()
 # Set HERMES_EXTRA_PROFILES=eko,other to auto-start extra profile gateways.
 EXTRA_PROFILES = [p.strip() for p in os.environ.get("HERMES_EXTRA_PROFILES", "").split(",") if p.strip()]
 extra_gateways: list[Gateway] = [Gateway(profile=p) for p in EXTRA_PROFILES]
+
+
+def profile_is_standalone(profile: str) -> bool:
+    """True when a named profile opts out of Hermes' default-profile multiplexer.
+
+    Since v2026.9.x the default gateway serves every named profile in-process
+    (`gateway.multiplex_profiles`, on by default, no opt-out) and refuses a
+    second per-profile gateway with exit 78. Only a profile whose config.yaml
+    sets `gateway.standalone: true` still runs its own gateway, so that is the
+    only kind HERMES_EXTRA_PROFILES may spawn.
+    """
+    import yaml
+
+    config_path = Path(HERMES_HOME) / "profiles" / profile / "config.yaml"
+    try:
+        loaded = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+    except (yaml.YAMLError, OSError):
+        return False
+    gateway_cfg = loaded.get("gateway") if isinstance(loaded, dict) else None
+    return isinstance(gateway_cfg, dict) and gateway_cfg.get("standalone") is True
 cfg_lock = asyncio.Lock()
 
 
@@ -1618,7 +1937,7 @@ class Dashboard:
                 # so the PTY child spawns instantly on first chat connect.
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
-                env=build_hermes_env(),
+                env=build_dashboard_env(),
             )
             print(f"[dashboard] spawned pid={self.proc.pid} → {HERMES_DASHBOARD_URL}", flush=True)
             # One line describing the auth shape this dashboard was started
@@ -1661,7 +1980,13 @@ class Dashboard:
             return
         self.proc.terminate()
         try:
-            await asyncio.wait_for(self.proc.wait(), timeout=5)
+            # v2026.9.21 joins its non-daemon state.db reconciliation worker on
+            # shutdown, after stopping hosted rooms and closing attached Chat
+            # PTYs. Upstream's own dashboard process manager gives that path a
+            # 10s SIGTERM grace: killing earlier can strand a ui-tui descendant
+            # holding a deleted state.db-wal generation, which makes the next
+            # dashboard start refuse. Keep 5s of headroom over upstream's floor.
+            await asyncio.wait_for(self.proc.wait(), timeout=15)
         except asyncio.TimeoutError:
             self.proc.kill()
             await self.proc.wait()
@@ -1876,8 +2201,52 @@ async def api_config_put(request: Request):
             for k, v in existing.items():
                 if k not in merged:
                     merged[k] = v
+            # Removing the router that currently owns model.provider must not
+            # leave a dangling provider id + model behind. That state looks
+            # configured to the supervisor but can never resolve at runtime.
+            # Clear only the shared active model; other saved providers and
+            # their per-provider model hints remain available for the next pick.
+            reset_removed_router_model = False
+            removed_router_ids = {
+                spec["provider_id"]
+                for key, spec in MANAGED_ROUTER_PROVIDERS.items()
+                if _router_provider_is_configured(existing, key)
+                and not _router_provider_is_configured(merged, key)
+            }
+            if removed_router_ids:
+                try:
+                    import yaml
+
+                    config_path = Path(HERMES_HOME) / "config.yaml"
+                    current_cfg = yaml.safe_load(config_path.read_text()) if config_path.exists() else {}
+                    current_model = current_cfg.get("model", {}) if isinstance(current_cfg, dict) else {}
+                    current_id = str(current_model.get("provider") or "").strip().lower()
+                    reset_removed_router_model = any(
+                        current_id in {provider_id, f"custom:{provider_id}"}
+                        for provider_id in removed_router_ids
+                    )
+                except (OSError, yaml.YAMLError):
+                    reset_removed_router_model = False
+            router_spec = MANAGED_ROUTER_PROVIDERS.get(active_provider_key)
+            if router_spec:
+                if not merged.get(active_provider_key, "").strip():
+                    return JSONResponse(
+                        {"error": f"{router_spec['name']} endpoint API key is required."},
+                        status_code=400,
+                    )
+                router_base_url = _router_base_url(merged, active_provider_key)
+                if not router_base_url:
+                    return JSONResponse(
+                        {"error": f"{router_spec['name']} base URL is required."},
+                        status_code=400,
+                    )
+                if url_error := _router_base_url_error(router_base_url):
+                    return JSONResponse(
+                        {"error": f"{router_spec['name']}: {url_error}"},
+                        status_code=400,
+                    )
             write_env(ENV_FILE, merged)
-            write_config_yaml(merged)
+            write_config_yaml(merged, reset_model=reset_removed_router_model)
 
         model_warning = None
         hermes_provider_id = HERMES_PROVIDER_IDS.get(active_provider_key)
@@ -2127,6 +2496,13 @@ BACKUP_DIR = Path(HERMES_HOME) / "backups"   # hermes' own pre-update-backup con
 PRE_RESTORE_KEEP = 3
 BACKUP_SUBPROCESS_TIMEOUT = 600  # 10 min ceiling for both `hermes backup` and `hermes import`
 
+# v2026.9.21 makes a partial archive an explicit result: the zip is kept, but
+# `hermes backup` exits 1 so unattended timers never publish it as a success.
+# The manual download endpoint intentionally still hands useful config/keys/
+# memories to the operator with a warning; the pre-restore safety snapshot
+# remains fail-closed on every non-zero rc.
+BACKUP_INCOMPLETE_RC = 1
+
 # hermes >= v2026.8.13 serializes backups across processes: `run_backup` takes a
 # flock on $HERMES_HOME/.backup.lock with a 0.25s acquire timeout and, on a
 # miss, raises SystemExit(2) after printing "another Hermes backup is already
@@ -2240,10 +2616,12 @@ def _sweep_stale_backup_tmpdirs() -> None:
         pass
 
 
-# Mirrors hermes' own _EXCLUDED_DIRS (hermes_cli/backup.py, v2026.8.13) so
-# _live_db_names() can never demand a database hermes deliberately skips. That
-# direction matters: a false "incomplete" ABORTS a restore, which is strictly
-# worse than the gap it closes. Re-check this against upstream on a bump.
+# Mirrors hermes' own _EXCLUDED_DIRS (hermes_cli/backup.py, re-verified
+# byte-identical at v2026.9.21) so _live_db_names() can never demand a database
+# hermes deliberately skips. That direction matters: a false "incomplete" ABORTS
+# a restore, which is strictly worse than the gap it closes. Re-check this
+# against upstream on a bump — and check _BACKUP_EXCLUDED_ROOT_DIRS below too,
+# because upstream now has TWO exclusion mechanisms, not one.
 _BACKUP_EXCLUDED_DIRS = {
     "hermes-agent", "__pycache__", ".git", "node_modules", "backups",
     "checkpoints", ".venv", "venv", "site-packages",
@@ -2252,6 +2630,55 @@ _BACKUP_EXCLUDED_DIRS = {
     # live browser-profile dirs (Chromium holds their SQLite files locked).
     "state-snapshots", "browser-profiles", "browser-profile",
 }
+
+# v2026.9.11 added a SECOND mechanism upstream (_EXCLUDED_ROOT_DIRS +
+# _in_excluded_root_dir in hermes_cli/backup.py): three trees skipped ONLY at the
+# top of HERMES_HOME (and at profiles/<name>/), holding machine-scoped bulk data
+# the new local-model runtime downloads — GGUF weights, llama.cpp binaries and a
+# managed Node install, which upstream's own comment calls "routinely tens to
+# hundreds of GB". Root-scoped, not flat: a skills/foo/models/ directory is still
+# backed up, so mirroring these into _BACKUP_EXCLUDED_DIRS would over-exclude.
+# Without this mirror a *.db under any of the three is demanded by
+# _live_db_names() while `hermes backup` deliberately omits it, and the resulting
+# false "incomplete" ABORTS a restore.
+_BACKUP_EXCLUDED_ROOT_DIRS = {"models", "runtimes", "node"}
+
+# v2026.9.21 added backup-only exclusions that are root-scoped for the same
+# reason as the runtime trees above. browser_profiles is Browser Use CLI's live
+# Chromium user-data dir (locked SQLite + credentials); a skill's own nested
+# browser_profiles/ remains user data and must still be archived.
+_BACKUP_EXCLUDED_BACKUP_ROOT_DIRS = {"browser_profiles"}
+
+# cache/ now mixes regenerable scratch/catalog/browser data with durable media
+# delivered to or received from users and the grounded-citations evidence
+# ledger. Hermes archives ONLY these subdirs at the root of each profile home.
+# This mirror is deliberately positive: adding "cache" to the flat exclusions
+# would silently drop the durable directories too.
+_BACKUP_KEPT_CACHE_SUBDIRS = {
+    "images", "audio", "videos", "documents", "screenshots", "citations",
+}
+
+
+def _in_excluded_root_dir(rel: Path) -> bool:
+    """Mirror of hermes' `_in_excluded_root_dir`: profile-home roots only.
+
+    `rel` is the path relative to HERMES_HOME, filename included — same shape
+    upstream passes. Strip ``profiles/<name>`` first so the same rules apply to
+    both the default home and every named profile without over-excluding a
+    nested skill/project directory that happens to use one of these names.
+    """
+    parts = rel.parts
+    if len(parts) >= 3 and parts[0] == "profiles":
+        parts = parts[2:]
+    if not parts:
+        return False
+    if parts[0] in _BACKUP_EXCLUDED_ROOT_DIRS or parts[0] in _BACKUP_EXCLUDED_BACKUP_ROOT_DIRS:
+        return True
+    return (
+        parts[0] == "cache"
+        and len(parts) >= 2
+        and parts[1] not in _BACKUP_KEPT_CACHE_SUBDIRS
+    )
 
 
 def _live_db_names() -> set[str]:
@@ -2278,10 +2705,12 @@ def _live_db_names() -> set[str]:
             try:
                 if not path.is_file():
                     continue
-                parents = path.relative_to(root).parts[:-1]
+                rel = path.relative_to(root)
             except (OSError, ValueError):
                 continue
-            if any(part in _BACKUP_EXCLUDED_DIRS for part in parents):
+            if any(part in _BACKUP_EXCLUDED_DIRS for part in rel.parts[:-1]):
+                continue
+            if _in_excluded_root_dir(rel):
                 continue
             found.add(path.name)
     except OSError:
@@ -2329,14 +2758,36 @@ async def api_backup_download(request: Request) -> Response:
     async with backup_lock:
         tmp_dir = tempfile.mkdtemp(prefix="hermes-backup-")
         zip_path = Path(tmp_dir) / "backup.zip"
+        # NOTE: v2026.9.11 gave `hermes backup` a `-k/--keep` (default 3) that
+        # DELETES older archives in the output directory. It is gated on the
+        # output filename starting with hermes' own "hermes-backup-" prefix, so
+        # "backup.zip" here is inert — but that is the only thing making it
+        # inert. Do not rename these outputs to the upstream prefix shape.
         rc, output = await _run_hermes_cli("backup", "-o", str(zip_path))
         if _is_backup_busy(rc, output):
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return JSONResponse({"error": BACKUP_BUSY_MESSAGE, "output": output[-2000:]},
                                 status_code=409)
-        if rc != 0 or not zip_path.exists():
+        # rc 1 with a real zip is v2026.9.21's explicit "archive kept, but
+        # incomplete" result. It is useful for a MANUAL export and is surfaced
+        # below with a warning. All other non-zero exits remain hard failures.
+        incomplete_exit = rc == BACKUP_INCOMPLETE_RC and zip_path.exists()
+        if (rc != 0 and not incomplete_exit) or not zip_path.exists():
             shutil.rmtree(tmp_dir, ignore_errors=True)
             return JSONResponse({"error": "Backup failed", "output": output[-2000:]}, status_code=500)
+
+        # An exit-1 path is useful only if Hermes actually closed a readable
+        # archive. Parsing the central directory is cheap and prevents us from
+        # sending a truncated/corrupt file merely because it exists.
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                zf.infolist()
+        except Exception as e:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            return JSONResponse(
+                {"error": f"Backup archive could not be read back: {e}", "output": output[-2000:]},
+                status_code=500,
+            )
 
         # Best-effort manifest entry for the restore-time version hint — never
         # fails the download if this step errors.
@@ -2353,13 +2804,22 @@ async def api_backup_download(request: Request) -> Response:
 
         filename = f"hermes-backup-{int(time.time())}.zip"
         headers = {}
+        warning_parts: list[str] = []
+        if incomplete_exit:
+            # The omitted item may be a non-DB file, which the artifact-level DB
+            # check below cannot name. Preserve that information even when every
+            # live SQLite database is present.
+            warning_parts.append("Hermes reported that one or more files could not be included")
         # Surface a partial archive instead of handing over a file the user
         # would only discover is incomplete when a restore fails. Warn rather
         # than block: config, keys and memories are still worth exporting even
         # when the session DB could not be snapshotted.
         if reason := _incomplete_backup_reason(zip_path):
-            print(f"[backup] incomplete archive — {reason}", flush=True)
-            headers["X-Backup-Warning"] = f"Backup is incomplete: {reason}."
+            warning_parts.append(reason)
+        if warning_parts:
+            warning = "; ".join(warning_parts)
+            print(f"[backup] incomplete archive — {warning}", flush=True)
+            headers["X-Backup-Warning"] = f"Backup is incomplete: {warning}."
         return FileResponse(
             zip_path,
             filename=filename,
@@ -2442,6 +2902,9 @@ async def api_backup_restore(request: Request) -> Response:
             # secrets suffix avoids a same-second collision silently clobbering
             # a distinct prior snapshot (two restores fired back-to-back).
             snap_path = BACKUP_DIR / f"pre-restore-{int(time.time())}-{secrets.token_hex(4)}.zip"
+            # "pre-restore-*" deliberately does not match hermes' own
+            # "hermes-backup-" prefix, so its v2026.9.11 `--keep 3` auto-prune
+            # never touches these; _prune_pre_restore_snapshots() owns them.
             rc, output = await _run_hermes_cli("backup", "-o", str(snap_path))
             # A lock collision is transient and retryable — say so, instead of
             # reporting it as "the backup command failed", which reads as data
@@ -2507,6 +2970,7 @@ async def api_backup_restore(request: Request) -> Response:
                     eg.start()
                     for eg in extra_gateways
                     if (Path(HERMES_HOME) / "profiles" / eg.profile / ".env").exists()
+                    and profile_is_standalone(eg.profile)
                 ])
 
             if rc != 0:
@@ -2554,7 +3018,10 @@ _IN_CONTAINER_INSTALL_RE = re.compile(
 # provider has a post_setup hook with an UNSATISFIED install-state predicate.
 # Today `_POST_SETUP_INSTALLED` (hermes_cli/tools_config.py) holds exactly one
 # entry — cua_driver, i.e. Computer Use — but upstream documents that dict as a
-# list to extend, so this will grow silently on future bumps.
+# list to extend, so this will grow silently on future bumps. Re-verified on
+# v2026.8.31: still just cua_driver. Do not confuse it with `_POST_SETUP_READY`
+# in the same file, which DID gain entries (lightpanda) — that one only gates an
+# interactive `hermes tools` prompt and never runs from an HTTP request.
 #
 # This is log-only, deliberately: unlike the two POST paths, we do NOT inject a
 # confirm() here. The existing notice says the install is wiped on redeploy,
@@ -2907,11 +3374,15 @@ async def auto_start():
     # crash-loop protection as the default profile.
     for eg in extra_gateways:
         profile_env = Path(HERMES_HOME) / "profiles" / eg.profile / ".env"
-        if profile_env.exists():
+        if not profile_env.exists():
+            print(f"[server] Extra profile '{eg.profile}' has no .env — skipping", flush=True)
+        elif not profile_is_standalone(eg.profile):
+            print(f"[server] Extra profile '{eg.profile}' is served by the default gateway's "
+                  f"profile multiplexer — not starting a separate gateway (set "
+                  f"gateway.standalone: true in its config.yaml to run one)", flush=True)
+        else:
             print(f"[server] Starting extra profile gateway: {eg.profile}", flush=True)
             asyncio.create_task(eg.start())
-        else:
-            print(f"[server] Extra profile '{eg.profile}' has no .env — skipping", flush=True)
 
 
 @asynccontextmanager
@@ -2998,6 +3469,24 @@ PROXIED_WS_PATHS = ("/api/pty", "/api/ws", "/api/events", "/api/console", "/api/
 # Chat/PTY vanishes mid-message with nothing in the logs. Same "both ends must
 # agree" trap as the keepalive pairing below. A cap, not a preallocation.
 HERMES_WS_MAX_BYTES = 384 * 1024 * 1024
+
+# RFC 6455 reserves 1005/1006/1015 for local reporting; an endpoint must never
+# put them on the wire. Uvicorn sends 1012 while the dashboard shuts down for a
+# service restart, but Hermes' current SPA reconnects on 1001/1006 and treats a
+# clean 1012 as a finished Chat. Normalize all of those restart/abrupt-loss
+# cases to 1001 (server going away). Valid application codes such as 4410 (PTY
+# exited) still pass through unchanged.
+_WS_CLOSE_CODES_REQUIRING_BROWSER_RECONNECT = frozenset({1005, 1006, 1012, 1015})
+
+
+def _browser_ws_close_code(upstream_code: object) -> int:
+    try:
+        code = int(upstream_code)
+    except (TypeError, ValueError):
+        return 1001
+    if code in _WS_CLOSE_CODES_REQUIRING_BROWSER_RECONNECT or not 1000 <= code <= 4999:
+        return 1001
+    return code
 
 
 async def _ws_pump_client_to_upstream(
@@ -3125,14 +3614,18 @@ async def ws_proxy(websocket: WebSocket) -> None:
                 pass
     finally:
         # websockets.connect() outside `async with` doesn't auto-close;
-        # do it explicitly. Same for the client side if still open.
+        # do it explicitly. Preserve a meaningful upstream close for the SPA:
+        # in particular, dashboard shutdown is 1012 (or sometimes local 1006),
+        # both mapped to 1001 so the browser reconnects instead of treating the
+        # Chat session as intentionally finished.
+        upstream_close_code = getattr(upstream, "close_code", None)
         try:
             await upstream.close()
         except Exception:
             pass
         if websocket.client_state == WebSocketState.CONNECTED:
             try:
-                await websocket.close()
+                await websocket.close(code=_browser_ws_close_code(upstream_close_code))
             except Exception:
                 pass
 

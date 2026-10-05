@@ -7,7 +7,8 @@ This is gldnlab's fork of praveen-ks-2001/hermes-agent-template. It deploys real
 One patch, ~23 lines in `server.py`: multi-profile gateway supervision via the `HERMES_EXTRA_PROFILES` env var (comma-separated profile names). The admin server auto-starts, crash-restarts, and cleanly stops a gateway for each listed profile, same as the default profile.
 
 - Do NOT drop this patch when merging upstream. After any merge, verify with: `grep -c HERMES_EXTRA_PROFILES server.py` (expect several hits) and `python3 -m py_compile server.py`.
-- The patch is still necessary as of upstream v2026.8.3: the template has no multi-profile support, and Hermes's native per-profile supervision (s6-overlay / systemd) only exists in the official Docker image or bare-metal installs — not in this template's custom container, where `server.py` is the supervisor.
+- **Since Hermes v2026.9.x the default gateway multiplexes profiles itself.** `gateway.multiplex_profiles` is on by default (there's no opt-out) and Hermes writes `true` into the default profile's config.yaml on first boot. The default gateway then serves every named profile in-process, and a separate per-profile gateway exits 78 ("fatal config"), which this supervisor never respawns. So `server.py` now spawns a listed profile only if its own config.yaml sets `gateway.standalone: true` (Hermes's temporary compatibility shim, see `profile_is_standalone()`). Any other listed profile is left to the multiplexer. Check `hermes -p <name> gateway status` to see which process serves a profile.
+- On Hermes v2026.8.x and earlier the patch was the only multi-profile support: the template had none, and Hermes's native per-profile supervision (s6-overlay / systemd) only existed in the official Docker image or bare-metal installs.
 
 ## Merging upstream
 

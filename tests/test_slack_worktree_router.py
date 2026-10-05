@@ -193,6 +193,24 @@ def test_gateway_registration_starts_delivery_recovery(durable_modules, monkeypa
     assert starts == [True]
 
 
+
+def test_delivery_worker_inherits_starters_profile_context(durable_modules, monkeypatch):
+    # Multiplexed Hermes gateways carry the active profile in contextvars.
+    import contextvars
+    _, _, plugin = durable_modules
+    profile = contextvars.ContextVar('profile', default='default')
+    seen = []
+    delivery = plugin.Delivery(SimpleNamespace(), lambda: None)
+    monkeypatch.setattr(delivery, 'run', lambda: seen.append(profile.get()))
+
+    def start_as_pip():
+        profile.set('pip')
+        delivery.start()
+
+    contextvars.copy_context().run(start_as_pip)
+    delivery.thread.join(timeout=5)
+    assert seen == ['pip']
+
 def test_early_cli_discovery_starts_recovery_but_dashboard_does_not(durable_modules, monkeypatch):
     _, _, plugin = durable_modules
     starts = []
