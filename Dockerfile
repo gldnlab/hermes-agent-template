@@ -94,7 +94,7 @@ ENV HERMES_REF=${HERMES_REF}
 # `node >=22.22.0` + `npm <11.10.0 || >=11.17.0` is now a hard EBADENGINE build
 # failure, not a warning — setup_24.x bundles an npm that satisfies neither.
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl ca-certificates git tini openssh-client && \
+    apt-get install -y --no-install-recommends curl ca-certificates git tini && \
     curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
     apt-get install -y --no-install-recommends nodejs && \
     rm -rf /var/lib/apt/lists/*
@@ -197,10 +197,6 @@ COPY server.py /app/server.py
 COPY templates/ /app/templates/
 COPY dashboard-themes/ /app/dashboard-themes/
 COPY start.sh /app/start.sh
-# Ship the Slack thread -> Git worktree router with the image. Hermes discovers
-# bundled general plugins automatically, but still requires an operator to add
-# `slack-worktree-router` to the default Hermes-Team (Atlas) profile only.
-COPY plugins/slack-worktree-router/ /opt/hermes-agent/plugins/slack-worktree-router/
 RUN chmod +x /app/start.sh
 
 ENV HOME=/data
