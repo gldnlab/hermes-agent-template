@@ -85,6 +85,8 @@ def patch_notifier(source):
         raise RuntimeError('Hermes notification delivery changed')
     return source.replace(anchor, '''        from gateway.cap_routing import full_notification
         msg = full_notification(self.board_slug, sub, ev, msg)
+        if msg is None:
+            return True  # Cap redundant follow-up run: recorded, nothing posted.
 ''' + anchor)
 
 

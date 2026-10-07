@@ -23,6 +23,9 @@ ROUTES = {'C0BUZL57K97': 'vw-crm', 'C0BUTAUA88M': 'vw-hq',
 ROOT = Path('/data/cap')
 LOG = logging.getLogger('cap.routing')
 STAMP = re.compile(r'^\d{10,}\.\d{6}$')
+# A follow-up run whose request an earlier run already answered ends with this
+# summary prefix; the notifier then records the event without posting it.
+NO_NEW_RESPONSE = 'NO_NEW_RESPONSE'
 
 
 def emit(event, **fields):
@@ -277,6 +280,10 @@ def worker_prompt(task, workspace, board):
                 'Respond to the latest request below; do not repeat completed work. '
                 'Use the mapped workspace only. Finish with kanban_request_review with your answer, '
                 'PR and preview where applicable. A question or proposal is not permission to edit. '
+                'If an earlier run\'s review summary already fully answered the latest request and it asks '
+                'for nothing new (no new question, approval, or change), do no work and finish with '
+                f'kanban_request_review whose summary starts with {NO_NEW_RESPONSE} and a one-line reason; '
+                'it will not be posted to Slack. '
                 'Do not create another task. No merge without Derek approving the exact PR/commit.\n'
                 + latest)
 
@@ -300,7 +307,11 @@ def owns_event(event):
 
 
 def full_notification(board, sub, event, original):
-    """Keep native delivery/retry ownership, but use the event's FULL run result."""
+    """Keep native delivery/retry ownership, but use the event's FULL run result.
+
+    Returns None for a redundant follow-up run; the patched notifier then marks
+    the event delivered without sending anything.
+    """
     if (os.environ.get('RAILWAY_SERVICE_NAME') != 'Hermes-Cap' or board not in ROUTES.values()
             or sub.get('platform') != 'slack' or event.kind not in ('review_requested', 'completed')):
         return original
@@ -314,6 +325,14 @@ def full_notification(board, sub, event, original):
         answer = (run['summary'] if run else None) or (event.payload or {}).get('summary')
         if not answer:
             return original
+        if str(answer).lstrip().startswith(NO_NEW_RESPONSE) and conn.execute(
+                'SELECT 1 FROM task_runs WHERE task_id=? AND id<? AND outcome IN '
+                "('review_requested','completed') LIMIT 1",
+                (sub['task_id'], getattr(event, 'run_id', None))).fetchone():
+            # Only after an earlier answered run; a first reply is never silenced.
+            emit('cap_redundant_run_silenced', board=board, task_id=sub['task_id'],
+                 run_id=getattr(event, 'run_id', None))
+            return None
         label = 'Ready for your review' if event.kind == 'review_requested' else 'Done'
         return str(answer).strip() + f'\n\n_{label} · `{sub["task_id"]}`_'
 

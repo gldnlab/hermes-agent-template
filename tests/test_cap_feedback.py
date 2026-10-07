@@ -122,6 +122,25 @@ def test_full_answer_is_from_exact_event_run_not_latest_and_preserves_end(router
         assert routing.full_notification('vw-site', sub, event, 'old notification') == 'old notification'
 
 
+def test_redundant_followup_run_is_silenced_but_first_answer_never_is(router, monkeypatch):
+    enqueue(router)
+    monkeypatch.setenv('RAILWAY_SERVICE_NAME', 'Hermes-Cap')
+    monkeypatch.setattr(routing, 'ROOT', router.root)
+    monkeypatch.setitem(sys.modules, 'hermes_cli', NS(kanban_db=router.kb))
+    noop = 'NO_NEW_RESPONSE: run 1 already answered this request.'
+    with router.connect('vw-site') as conn, conn:
+        task = conn.execute('SELECT task_id FROM cap_threads').fetchone()[0]
+        conn.execute('INSERT INTO task_runs VALUES(1,?,?,?,1)', (task, noop, 'review_requested'))
+        conn.execute('INSERT INTO task_runs VALUES(2,?,?,?,2)', (task, noop, 'review_requested'))
+        conn.execute('INSERT INTO task_runs VALUES(3,?,?,?,3)', (task, 'Real answer', 'review_requested'))
+    sub = dict(task_id=task, platform='slack', chat_id='C0BV1CCCPS8', thread_id='1788976794.031949')
+    render = lambda run: routing.full_notification(
+        'vw-site', sub, NS(kind='review_requested', run_id=run, payload={}), 'old notification')
+    assert render(1).startswith(noop)  # No earlier answered run: still posted.
+    assert render(2) is None
+    assert render(3).startswith('Real answer')
+
+
 def test_feedback_patches_are_narrow_and_fail_on_drift():
     source = ('async def on_processing_start(self, event):\n'
               '        """Add an in-progress reaction when message processing begins."""\n'
@@ -137,5 +156,6 @@ def test_feedback_patches_are_narrow_and_fail_on_drift():
     result = patch.patch_notifier(source)
     compile(result, '<notifier>', 'exec')
     assert 'full_notification(self.board_slug, sub, ev, msg)' in result
+    assert 'if msg is None:\n            return True' in result
     with pytest.raises(RuntimeError):
         patch.patch_notifier(result)
