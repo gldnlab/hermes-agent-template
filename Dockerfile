@@ -149,17 +149,22 @@ RUN npm install --global --ignore-scripts --no-audit --no-fund @openai/codex@0.1
 # `slack-worktree-router` to the default Hermes-Team (Atlas) profile only.
 COPY plugins/slack-worktree-router/ /opt/hermes-agent/plugins/slack-worktree-router/
 # Claude Subscription DirectSDK model provider (needs Hermes >= 0.21.4, i.e.
-# v2026.9.21+). Pinned to the plugin commit and the Claude Code release the
-# plugin README qualifies. start.sh links it into $HERMES_HOME/plugins, where
+# v2026.9.21+). The standalone plugin repo was archived on 2026-10-10; the
+# plugin now lives in the claude-subscription-directsdk/ folder of
+# NousResearch/hermes-official-plugins, pinned here to its latest commit
+# (v0.3.3). Claude Code must be >= 2.1.293 for the plugin's `haiku` alias
+# (Haiku 5.5); `sonnet` (Sonnet 5.5) needs 2.1.284 and `opus` (Opus 5.5)
+# 2.1.280. start.sh links the plugin into $HERMES_HOME/plugins, where
 # model-provider discovery looks. Auth comes from CLAUDE_CODE_OAUTH_TOKEN
 # (`claude setup-token`) in the Railway env; ANTHROPIC_API_KEY/_AUTH_TOKEN/
 # _BASE_URL must NOT be set on this service or the plugin refuses to run.
-RUN npm install --global --no-audit --no-fund @anthropic-ai/claude-code@2.1.263 && \
+RUN npm install --global --no-audit --no-fund @anthropic-ai/claude-code@2.1.296 && \
     claude --version && \
-    git clone https://github.com/NousResearch/hermes-plugin-claude-subscription-directsdk \
+    git clone https://github.com/NousResearch/hermes-official-plugins /tmp/hermes-official-plugins && \
+    git -C /tmp/hermes-official-plugins checkout --quiet 56c9c0c9f06564d4b03918cc1cfa3697816e5735 && \
+    cp -r /tmp/hermes-official-plugins/claude-subscription-directsdk \
         /opt/claude-subscription-directsdk-experimental && \
-    cd /opt/claude-subscription-directsdk-experimental && \
-    git checkout --quiet 602393b && rm -rf .git
+    rm -rf /tmp/hermes-official-plugins
 RUN chmod +x /app/start.sh
 
 ENV HOME=/data
