@@ -199,6 +199,15 @@ COPY dashboard-themes/ /app/dashboard-themes/
 COPY start.sh /app/start.sh
 RUN chmod +x /app/start.sh
 
+# Claude Code CLI for the claude-subscription-directsdk-experimental provider
+# plugin (installed by the operator onto the /data volume). The plugin shells
+# out to `claude`, so the CLI must be in the image. Login is per-service:
+# run `claude auth login` once in the container; with HOME=/data the
+# credentials persist on the volume. 2.1.296 is the version qualified against
+# plugin v0.3.3 (>= 2.1.293 for its `haiku` alias).
+RUN npm install --global --no-audit --no-fund @anthropic-ai/claude-code@2.1.296 && \
+    claude --version
+
 ENV HOME=/data
 ENV HERMES_HOME=/data/.hermes
 
